@@ -83,12 +83,27 @@ node dev-ports.js
 - 같은 버전이 이미 npm에 있으면 자동으로 건너뜁니다
 - npm 웹사이트에서 `Trusted Publisher`를 한 번 연결해야 합니다
 
-설정 방법:
+첫 배포 전:
+
+```bash
+npm login
+npm publish
+```
+
+첫 배포 후 설정 방법:
 
 1. npm 웹사이트에 브라우저 로그인
-2. `portwarden` 패키지 페이지 생성 또는 배포 준비
-3. 패키지 설정에서 `Trusted Publishers` 열기
-4. GitHub repository `chenjingdev/portwarden` 연결
-5. workflow filename에 `npm-publish.yml` 입력 후 저장
+2. `portwarden` 패키지 설정에서 `Trusted Publishers` 열기
+3. GitHub repository `chenjingdev/portwarden` 연결
+4. workflow filename에 `npm-publish.yml` 입력 후 저장
 
 이렇게 연결해두면 별도 `NPM_TOKEN` 없이 GitHub Actions가 publish합니다.
+
+다음 배포부터는 버전만 올리고 `main`에 푸시하면 됩니다.
+
+```bash
+npm version patch
+git push
+```
+
+필요하면 `patch` 대신 `minor` 또는 `major`를 쓰면 됩니다.
