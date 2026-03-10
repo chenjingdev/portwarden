@@ -30,7 +30,7 @@
     "node": ">=18"
   },
   "bin": {
-    "portwarden": "./dev-ports.js"
+    "portwarden": "dev-ports.js"
   },
   "scripts": {
     "start": "node ./dev-ports.js",
