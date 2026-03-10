@@ -1,6 +1,6 @@
 {
   "name": "portwarden",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Small CLI for inspecting and cleaning up active dev ports",
   "author": "김아람 <chenjing@laonpeople.com>",
   "license": "MIT",
