@@ -2,7 +2,16 @@
   "name": "portwarden",
   "version": "0.2.0",
   "description": "Small CLI for inspecting and cleaning up active dev ports",
+  "author": "김아람 <chenjing@laonpeople.com>",
   "license": "MIT",
+  "homepage": "https://github.com/chenjingdev/portwarden#readme",
+  "bugs": {
+    "url": "https://github.com/chenjingdev/portwarden/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chenjingdev/portwarden.git"
+  },
   "files": [
     "dev-ports.js",
     "lib",
