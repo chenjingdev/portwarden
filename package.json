@@ -1,0 +1,32 @@
+{
+  "name": "portwarden",
+  "version": "0.2.0",
+  "description": "Small CLI for inspecting and cleaning up active dev ports",
+  "license": "MIT",
+  "files": [
+    "dev-ports.js",
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "cli",
+    "ports",
+    "dev-server",
+    "tui",
+    "vite",
+    "process"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "portwarden": "./dev-ports.js"
+  },
+  "scripts": {
+    "start": "node ./dev-ports.js",
+    "watch": "node ./dev-ports.js --plain --watch",
+    "plain": "node ./dev-ports.js --plain",
+    "tui": "node ./dev-ports.js --tui"
+  }
+}
