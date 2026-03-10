@@ -81,6 +81,14 @@ node dev-ports.js
 
 - 워크플로: `.github/workflows/npm-publish.yml`
 - 같은 버전이 이미 npm에 있으면 자동으로 건너뜁니다
-- GitHub 저장소 `Settings -> Secrets and variables -> Actions`에 `NPM_TOKEN` 시크릿을 추가해야 합니다
+- npm 웹사이트에서 `Trusted Publisher`를 한 번 연결해야 합니다
 
-`NPM_TOKEN`은 npm에서 발급한 publish 가능한 토큰을 넣으면 됩니다.
+설정 방법:
+
+1. npm 웹사이트에 브라우저 로그인
+2. `portwarden` 패키지 페이지 생성 또는 배포 준비
+3. 패키지 설정에서 `Trusted Publishers` 열기
+4. GitHub repository `chenjingdev/portwarden` 연결
+5. workflow filename에 `npm-publish.yml` 입력 후 저장
+
+이렇게 연결해두면 별도 `NPM_TOKEN` 없이 GitHub Actions가 publish합니다.
