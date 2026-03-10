@@ -98,12 +98,3 @@ npm publish
 4. workflow filename에 `npm-publish.yml` 입력 후 저장
 
 이렇게 연결해두면 별도 `NPM_TOKEN` 없이 GitHub Actions가 publish합니다.
-
-다음 배포부터는 버전만 올리고 `main`에 푸시하면 됩니다.
-
-```bash
-npm version patch
-git push
-```
-
-필요하면 `patch` 대신 `minor` 또는 `major`를 쓰면 됩니다.
