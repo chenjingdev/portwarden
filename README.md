@@ -74,3 +74,13 @@ node dev-ports.js
 ## 참고
 
 한글 두벌식 입력 상태에서도 같은 키 위치로 단축키가 동작합니다. 다만 터미널 TUI는 물리 키 위치가 아니라 최종 입력 문자를 받는 경우가 많아서, 모든 키보드 레이아웃을 자동으로 같은 방식으로 맞추는 건 현실적으로 어렵습니다. 필요한 레이아웃은 별도로 추가하는 방식이 맞습니다.
+
+## 자동 배포
+
+`main` 브랜치에 푸시하면 GitHub Actions가 npm 배포를 시도합니다.
+
+- 워크플로: `.github/workflows/npm-publish.yml`
+- 같은 버전이 이미 npm에 있으면 자동으로 건너뜁니다
+- GitHub 저장소 `Settings -> Secrets and variables -> Actions`에 `NPM_TOKEN` 시크릿을 추가해야 합니다
+
+`NPM_TOKEN`은 npm에서 발급한 publish 가능한 토큰을 넣으면 됩니다.
