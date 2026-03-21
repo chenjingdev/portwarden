@@ -17,10 +17,10 @@ jobs:
       id-token: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -38,7 +38,7 @@ jobs:
         run: |
           node --check dev-ports.js lib/*.js test/*.js
           pnpm test
-          pnpm publish --dry-run --access public --no-git-checks
+          npm publish --dry-run --access public
 
       - name: Check published version
         id: registry
@@ -49,21 +49,9 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Check npm token
-        if: steps.registry.outputs.exists != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NODE_AUTH_TOKEN" ]; then
-            echo "NPM_TOKEN secret is not configured."
-            exit 1
-          fi
-
       - name: Publish package
         if: steps.registry.outputs.exists != 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: pnpm publish --access public --no-git-checks
+        run: npm publish --access public
 
       - name: Skip duplicate version
         if: steps.registry.outputs.exists == 'true'
