@@ -6,6 +6,9 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -22,6 +25,9 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      - name: Enable pnpm
+        run: corepack enable
+
       - name: Read package metadata
         id: pkg
         run: |
@@ -30,8 +36,9 @@ jobs:
 
       - name: Validate package
         run: |
-          node --check dev-ports.js lib/*.js
-          npm pack --dry-run
+          node --check dev-ports.js lib/*.js test/*.js
+          pnpm test
+          pnpm publish --dry-run --access public --no-git-checks
 
       - name: Check published version
         id: registry
@@ -42,9 +49,21 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check npm token
+        if: steps.registry.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "NPM_TOKEN secret is not configured."
+            exit 1
+          fi
+
       - name: Publish package
         if: steps.registry.outputs.exists != 'true'
-        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: pnpm publish --access public --no-git-checks
 
       - name: Skip duplicate version
         if: steps.registry.outputs.exists == 'true'

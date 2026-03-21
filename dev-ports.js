@@ -2,6 +2,7 @@
 
 const { parseArgs, printHelp } = require("./lib/args");
 const { renderWatch } = require("./lib/cli");
+const { loadConfig } = require("./lib/config");
 const { renderOnce } = require("./lib/output");
 const { collectAllListeners, findNextAvailablePort, killByPid, killByPort, selectListeners } = require("./lib/ports");
 const { startTui } = require("./lib/tui");
@@ -20,6 +21,7 @@ function shouldStartDefaultTui(options) {
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
+  const config = loadConfig();
 
   if (options.help) {
     printHelp();
@@ -54,7 +56,7 @@ function main() {
   }
 
   const allListeners = collectAllListeners();
-  const listeners = selectListeners(allListeners, options);
+  const listeners = selectListeners(allListeners, options, config);
   renderOnce(listeners, allListeners.length, options);
 }
 

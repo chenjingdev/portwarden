@@ -1,6 +1,6 @@
 {
   "name": "portwarden",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Small CLI for inspecting and cleaning up active dev ports",
   "author": "김아람 <chenjing@laonpeople.com>",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "start": "node ./dev-ports.js",
     "watch": "node ./dev-ports.js --plain --watch",
     "plain": "node ./dev-ports.js --plain",
-    "tui": "node ./dev-ports.js --tui"
+    "tui": "node ./dev-ports.js --tui",
+    "test": "node --test"
   }
 }
