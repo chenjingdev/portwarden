@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { getEntryPreferenceKey, sortListeners } = require("../lib/ports");
+const { getEntryPreferenceKey, selectListeners, sortListeners } = require("../lib/ports");
 
 function createEntry(overrides = {}) {
   return {
@@ -76,5 +76,41 @@ test("sortListeners places pinned entries first and respects saved order", () =>
   assert.deepEqual(
     sorted.map((entry) => entry.displayProject),
     ["gamma", "beta", "alpha"]
+  );
+});
+
+test("selectListeners keeps pinned non-dev entries in the default view", () => {
+  const alpha = createEntry({
+    pid: 1001,
+    port: 3000,
+    cwd: "/Users/test/dev/alpha",
+    projectName: "alpha",
+    displayProject: "alpha",
+    displayCwd: "~/dev/alpha",
+    kind: "dev",
+    args: "pnpm dev --port 3000",
+    displayCommand: "pnpm dev --port 3000",
+  });
+  const postgres = createEntry({
+    pid: 2001,
+    port: 5432,
+    cwd: "/Users/test/local/postgres",
+    projectName: "postgres",
+    displayProject: "postgres",
+    displayCwd: "~/local/postgres",
+    kind: "system",
+    command: "postgres",
+    args: "postgres -D /opt/homebrew/var/postgresql@16",
+    displayCommand: "postgres -D /opt/homebrew/var/postgresql@16",
+  });
+
+  const selected = selectListeners([postgres, alpha], { all: false }, {
+    pinnedEntryKeys: [getEntryPreferenceKey(postgres)],
+    orderedEntryKeys: [getEntryPreferenceKey(postgres), getEntryPreferenceKey(alpha)],
+  });
+
+  assert.deepEqual(
+    selected.map((entry) => entry.port),
+    [5432, 3000]
   );
 });
