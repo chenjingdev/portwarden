@@ -14,11 +14,20 @@ function createEntry(overrides = {}) {
     ppid: overrides.ppid ?? 1,
     port: overrides.port ?? 3000,
     host: overrides.host ?? "127.0.0.1",
+    displayHost: overrides.displayHost ?? overrides.host ?? "127.0.0.1",
     command: overrides.command ?? "node",
     args: overrides.args ?? "pnpm dev --port 3000",
     cwd: overrides.cwd ?? "/Users/test/dev/sample",
     elapsed: overrides.elapsed ?? "00:10",
     kind: overrides.kind ?? "dev",
+    appFamily: overrides.appFamily ?? "",
+    entryType: overrides.entryType,
+    selectionKey: overrides.selectionKey,
+    groupKey: overrides.groupKey,
+    groupMember: overrides.groupMember ?? false,
+    groupExpanded: overrides.groupExpanded ?? false,
+    groupCount: overrides.groupCount ?? 0,
+    groupMembers: overrides.groupMembers ?? [],
     projectName: overrides.projectName ?? "sample",
     displayProject: overrides.displayProject ?? "sample",
     displayCommand: overrides.displayCommand ?? "pnpm dev --port 3000",
@@ -38,6 +47,7 @@ function createPinnedState(entry, overrides = {}) {
     pendingAction: overrides.pendingAction ?? null,
     error: overrides.error ?? "",
     status: overrides.status ?? "",
+    expandedAppGroups: overrides.expandedAppGroups ?? new Set(),
     selectionKey: null,
   };
 }
@@ -60,6 +70,7 @@ function createRenderState(entries, overrides = {}) {
     selectedIndex: overrides.selectedIndex ?? 0,
     listScope: overrides.listScope ?? "all",
     status: overrides.status ?? "",
+    expandedAppGroups: overrides.expandedAppGroups ?? new Set(),
     visibleListeners: entries,
   };
 }
@@ -213,4 +224,297 @@ test("setSelectionByIndex keeps the cursor on the same row after the list order 
 
   assert.equal(state.selectedIndex, 1);
   assert.equal(state.selectionKey, "1003:3002:127.0.0.1");
+});
+
+test("renderMainScreen prefers normalized host labels in rows and details", () => {
+  const entry = createEntry({
+    host: "::1",
+    displayHost: "localhost",
+    displayProject: "@playwright/mcp",
+    projectName: "@playwright/mcp",
+    displayCwd: "",
+    displayCommand: "pnpm dlx @playwright/mcp --port 53188",
+  });
+  const state = createRenderState([entry], {
+    listScope: "all",
+    selectedIndex: 0,
+  });
+
+  const lines = __testing.renderMainScreen(state, 120, 24).map(stripAnsi);
+  const portRow = lines.find((line) => line.includes("3000"));
+
+  assert.ok(portRow?.includes("localhost"));
+  assert.match(lines.join("\n"), /host localhost/);
+});
+
+test("buildVisibleEntries collapses app helper listeners into a single group row in all view", () => {
+  const antigravityHelper = createEntry({
+    pid: 2001,
+    port: 59267,
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "Antigravity Helper (Plugin)",
+    displayProject: "Antigravity Helper (Plugin)",
+    displayCommand: "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Plugin).app/Contents/MacOS/Antigravity Helper (Plugin)",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const antigravityLanguageServer = createEntry({
+    pid: 2002,
+    port: 61473,
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "language_server_macos_arm",
+    displayProject: "language_server_macos_arm",
+    displayCommand: "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const devEntry = createEntry({
+    pid: 1001,
+    port: 53188,
+    kind: "dev",
+    projectName: "@playwright/mcp",
+    displayProject: "@playwright/mcp",
+    displayCommand: "pnpm dlx @playwright/mcp --extension",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const figmaAgent = createEntry({
+    pid: 2200,
+    port: 44950,
+    kind: "app",
+    appFamily: "Figma",
+    projectName: "figma_agent",
+    displayProject: "figma_agent",
+    displayCommand: "~/Library/Application Support/Figma/FigmaAgent.app/Contents/MacOS/figma_agent",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const state = createRenderState([], {
+    allListeners: [devEntry, antigravityHelper, figmaAgent, antigravityLanguageServer],
+    listScope: "all",
+  });
+
+  const visibleEntries = __testing.buildVisibleEntries([devEntry, antigravityHelper, figmaAgent, antigravityLanguageServer], state);
+
+  assert.equal(visibleEntries.length, 3);
+  assert.equal(visibleEntries[1].entryType, "app-group");
+  assert.equal(visibleEntries[1].displayProject, "Antigravity");
+  assert.equal(visibleEntries[1].groupCount, 2);
+  assert.equal(visibleEntries[2].displayProject, "figma_agent");
+});
+
+test("requestKillSelectedEntry blocks destructive actions on collapsed app groups", () => {
+  const state = createRenderState([], {
+    listScope: "all",
+  });
+  state.visibleListeners = [
+    {
+      entryType: "app-group",
+      selectionKey: "app:antigravity",
+      groupKey: "app:antigravity",
+      groupExpanded: false,
+      groupCount: 2,
+      groupMembers: [],
+      kind: "app",
+      appFamily: "Antigravity",
+      port: "2x",
+      pid: "-",
+      elapsed: "-",
+      host: "localhost",
+      displayHost: "localhost",
+      projectName: "Antigravity",
+      displayProject: "Antigravity",
+      displayCommand: "2 listeners",
+      displayCwd: "",
+    },
+  ];
+
+  const result = __testing.requestKillSelectedEntry(state, "SIGTERM", () => {}, () => {});
+
+  assert.equal(result, "blocked");
+  assert.equal(state.error, "Expand Antigravity first to stop a specific listener.");
+});
+
+test("renderMainScreen shows grouped app rows with a count label", () => {
+  const groupedEntry = {
+    entryType: "app-group",
+    selectionKey: "app:antigravity",
+    groupKey: "app:antigravity",
+    groupExpanded: false,
+    groupCount: 4,
+    groupMembers: [],
+    kind: "app",
+    appFamily: "Antigravity",
+    port: "4x",
+    pid: "-",
+    elapsed: "-",
+    host: "localhost",
+    displayHost: "localhost",
+    projectName: "Antigravity",
+    displayProject: "Antigravity",
+    displayCommand: "4 listeners · Antigravity Helper (Plugin), language_server_macos_arm",
+    displayCwd: "",
+  };
+  const state = createRenderState([groupedEntry], {
+    allListeners: Array.from({ length: 4 }, (_, index) =>
+      createEntry({
+        pid: 3000 + index,
+        port: 6100 + index,
+        kind: "app",
+        appFamily: "Antigravity",
+        displayProject: "Antigravity Helper (Plugin)",
+        projectName: "Antigravity Helper (Plugin)",
+      })
+    ),
+    listScope: "all",
+  });
+
+  const lines = __testing.renderMainScreen(state, 140, 24).map(stripAnsi);
+  const groupedRow = lines.find((line) => line.includes("Antigravity"));
+
+  assert.ok(lines[0].includes("[4 ports]"));
+  assert.ok(lines[0].includes("[1 rows]"));
+  assert.ok(groupedRow?.includes("4x"));
+  assert.ok(groupedRow?.includes("> Antigravity"));
+  assert.ok(groupedRow?.includes("APP"));
+});
+
+test("renderMainScreen shows expanded app groups with an open marker", () => {
+  const expandedGroup = {
+    entryType: "app-group",
+    selectionKey: "app:antigravity",
+    groupKey: "app:antigravity",
+    groupExpanded: true,
+    groupCount: 2,
+    groupMembers: [],
+    kind: "app",
+    appFamily: "Antigravity",
+    port: "2x",
+    pid: "-",
+    elapsed: "-",
+    host: "localhost",
+    displayHost: "localhost",
+    projectName: "Antigravity",
+    displayProject: "Antigravity",
+    displayCommand: "open · 2 listeners · enter collapse",
+    displayCwd: "",
+  };
+  const childEntry = createEntry({
+    pid: 4001,
+    port: 61473,
+    kind: "app",
+    appFamily: "Antigravity",
+    groupKey: "app:antigravity",
+    groupMember: true,
+    displayProject: "language_server_macos_arm",
+    projectName: "language_server_macos_arm",
+    displayCommand: "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const state = createRenderState([expandedGroup, childEntry], {
+    allListeners: [childEntry],
+    listScope: "all",
+  });
+
+  const lines = __testing.renderMainScreen(state, 140, 24).map(stripAnsi);
+  const groupedRow = lines.find((line) => line.includes("2x"));
+  const childRow = lines.find((line) => line.includes("language_server_macos"));
+
+  assert.ok(groupedRow?.includes("v Antigravity"));
+  assert.ok(groupedRow?.includes("APP"));
+  assert.ok(groupedRow?.includes("open · 2 listeners"));
+  assert.ok(childRow);
+  assert.ok(!childRow.includes("APP"));
+  assert.match(lines.join("\n"), /\|\s+language_server_macos/);
+});
+
+test("renderMainScreen colors collapsed and expanded app groups differently", () => {
+  const collapsedGroup = {
+    entryType: "app-group",
+    selectionKey: "app:antigravity",
+    groupKey: "app:antigravity",
+    groupExpanded: false,
+    groupCount: 2,
+    groupMembers: [],
+    kind: "app",
+    appFamily: "Antigravity",
+    port: "2x",
+    pid: "-",
+    elapsed: "-",
+    host: "localhost",
+    displayHost: "localhost",
+    projectName: "Antigravity",
+    displayProject: "Antigravity",
+    displayCommand: "closed · 2 listeners",
+    displayCwd: "",
+  };
+  const expandedGroup = {
+    ...collapsedGroup,
+    selectionKey: "app:figma",
+    groupKey: "app:figma",
+    groupExpanded: true,
+    appFamily: "Figma",
+    projectName: "Figma",
+    displayProject: "Figma",
+    displayCommand: "open · 2 listeners",
+  };
+  const state = createRenderState([collapsedGroup, expandedGroup], {
+    allListeners: [],
+    listScope: "all",
+  });
+
+  const lines = __testing.renderMainScreen(state, 140, 24);
+  const collapsedRow = lines.find((line) => line.includes("Antigravity"));
+  const expandedRow = lines.find((line) => line.includes("Figma"));
+
+  assert.match(collapsedRow, /\x1b\[33m/);
+  assert.match(expandedRow, /\x1b\[36m/);
+});
+
+test("handleMainViewKey uses arrows to expand and collapse app groups", () => {
+  const actionsCalled = [];
+  const actions = new Proxy(
+    {},
+    {
+      get(_target, prop) {
+        return () => {
+          actionsCalled.push(prop);
+        };
+      },
+    }
+  );
+  const groupEntry = {
+    entryType: "app-group",
+    selectionKey: "app:antigravity",
+    groupKey: "app:antigravity",
+    groupExpanded: false,
+    displayProject: "Antigravity",
+  };
+  const childEntry = createEntry({
+    groupKey: "app:antigravity",
+    groupMember: true,
+    displayProject: "language_server_macos_arm",
+    projectName: "language_server_macos_arm",
+  });
+  const state = createRenderState([groupEntry, childEntry], {
+    allListeners: [],
+    listScope: "all",
+    selectedIndex: 0,
+  });
+
+  assert.equal(__testing.handleMainViewKey(state, "\u001b[C", actions), true);
+  assert.deepEqual(actionsCalled, ["toggleSelectedAppGroup"]);
+
+  actionsCalled.length = 0;
+  state.visibleListeners[0].groupExpanded = true;
+  assert.equal(__testing.handleMainViewKey(state, "\u001b[D", actions), true);
+  assert.deepEqual(actionsCalled, ["toggleSelectedAppGroup"]);
+
+  actionsCalled.length = 0;
+  state.selectedIndex = 1;
+  assert.equal(__testing.handleMainViewKey(state, "\u001b[D", actions), true);
+  assert.deepEqual(actionsCalled, ["toggleSelectedAppGroup"]);
 });

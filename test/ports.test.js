@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { getEntryListenerKey, getEntryPreferenceKey, selectListeners, sortListeners } = require("../lib/ports");
+const { __testing, getEntryListenerKey, getEntryPreferenceKey, selectListeners, sortListeners } = require("../lib/ports");
 
 function createEntry(overrides = {}) {
   return {
@@ -9,11 +9,13 @@ function createEntry(overrides = {}) {
     ppid: overrides.ppid ?? 1,
     port: overrides.port ?? 3000,
     host: overrides.host ?? "127.0.0.1",
+    displayHost: overrides.displayHost ?? overrides.host ?? "127.0.0.1",
     command: overrides.command ?? "node",
     args: overrides.args ?? "pnpm dev --port 3000",
     cwd: overrides.cwd ?? "/Users/test/dev/sample",
     elapsed: overrides.elapsed ?? "00:10",
     kind: overrides.kind ?? "dev",
+    appFamily: overrides.appFamily ?? "",
     projectName: overrides.projectName ?? "sample",
     displayProject: overrides.displayProject ?? "sample",
     displayCommand: overrides.displayCommand ?? "pnpm dev --port 3000",
@@ -148,4 +150,30 @@ test("selectListeners keeps individually pinned listeners without pinning the wh
     selected.map((entry) => entry.port),
     [4173]
   );
+});
+
+test("getProjectName falls back to the pnpm dlx package name when cwd is root", () => {
+  const details = {
+    cwd: "/",
+    command: "node",
+    args: "node /Users/test/Library/Caches/pnpm/dlx/5e6c877401e79938bd0cfe60829a8cb14dbcb809dcffe7ee4ac5ac31ebac41b4/19d659510aa-caa9/node_modules/.bin/../.pnpm/@playwright+mcp@0.0.70/node_modules/@playwright/mcp/cli.js --port 53188",
+  };
+
+  assert.equal(__testing.getProjectName(details), "@playwright/mcp");
+});
+
+test("formatDisplayCwd hides root cwd for pnpm dlx cache processes", () => {
+  const args = "node /Users/test/Library/Caches/pnpm/dlx/5e6c877401e79938bd0cfe60829a8cb14dbcb809dcffe7ee4ac5ac31ebac41b4/19d659510aa-caa9/node_modules/.bin/../.pnpm/@playwright+mcp@0.0.70/node_modules/@playwright/mcp/cli.js --port 53188";
+
+  assert.equal(__testing.formatDisplayCwd("/", args), "");
+});
+
+test("inferAppFamily groups desktop helper processes by the host app", () => {
+  const details = {
+    cwd: "/",
+    command: "Antigravity Helper (Plugin)",
+    args: "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Plugin).app/Contents/MacOS/Antigravity Helper (Plugin)",
+  };
+
+  assert.equal(__testing.inferAppFamily(details), "Antigravity");
 });
