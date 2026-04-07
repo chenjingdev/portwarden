@@ -1,7 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { getEntryPreferenceKey, selectListeners, sortListeners } = require("../lib/ports");
+const { getEntryListenerKey, getEntryPreferenceKey, selectListeners, sortListeners } = require("../lib/ports");
 
 function createEntry(overrides = {}) {
   return {
@@ -69,8 +69,8 @@ test("sortListeners places pinned entries first and respects saved order", () =>
   });
 
   const sorted = sortListeners([alpha, beta, gamma], {
-    pinnedEntryKeys: [getEntryPreferenceKey(gamma)],
-    orderedEntryKeys: [getEntryPreferenceKey(gamma), getEntryPreferenceKey(beta), getEntryPreferenceKey(alpha)],
+    pinnedListenerKeys: [getEntryListenerKey(gamma)],
+    orderedEntryKeys: [getEntryListenerKey(gamma), getEntryListenerKey(beta), getEntryListenerKey(alpha)],
   });
 
   assert.deepEqual(
@@ -105,12 +105,47 @@ test("selectListeners keeps pinned non-dev entries in the default view", () => {
   });
 
   const selected = selectListeners([postgres, alpha], { all: false }, {
-    pinnedEntryKeys: [getEntryPreferenceKey(postgres)],
-    orderedEntryKeys: [getEntryPreferenceKey(postgres), getEntryPreferenceKey(alpha)],
+    pinnedListenerKeys: [getEntryListenerKey(postgres)],
+    orderedEntryKeys: [getEntryListenerKey(postgres), getEntryListenerKey(alpha)],
   });
 
   assert.deepEqual(
     selected.map((entry) => entry.port),
     [5432, 3000]
+  );
+});
+
+test("selectListeners keeps individually pinned listeners without pinning the whole app group", () => {
+  const alpha3000 = createEntry({
+    pid: 1001,
+    port: 3000,
+    cwd: "/Users/test/dev/alpha",
+    projectName: "alpha",
+    displayProject: "alpha",
+    displayCwd: "~/dev/alpha",
+    kind: "system",
+    args: "pnpm dev --port 3000",
+    displayCommand: "pnpm dev --port 3000",
+  });
+  const alpha4173 = createEntry({
+    pid: 1002,
+    port: 4173,
+    cwd: "/Users/test/dev/alpha",
+    projectName: "alpha",
+    displayProject: "alpha",
+    displayCwd: "~/dev/alpha",
+    kind: "system",
+    args: "pnpm dev --port 4173",
+    displayCommand: "pnpm dev --port 4173",
+  });
+
+  const selected = selectListeners([alpha3000, alpha4173], { all: false }, {
+    pinnedListenerKeys: [getEntryListenerKey(alpha4173)],
+    orderedEntryKeys: [getEntryListenerKey(alpha4173)],
+  });
+
+  assert.deepEqual(
+    selected.map((entry) => entry.port),
+    [4173]
   );
 });
