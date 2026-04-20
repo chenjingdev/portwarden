@@ -9,6 +9,7 @@ function createEntry(overrides = {}) {
     ppid: overrides.ppid ?? 1,
     port: overrides.port ?? 3000,
     host: overrides.host ?? "127.0.0.1",
+    listenerHosts: overrides.listenerHosts ?? [overrides.host ?? "127.0.0.1"],
     displayHost: overrides.displayHost ?? overrides.host ?? "127.0.0.1",
     command: overrides.command ?? "node",
     args: overrides.args ?? "pnpm dev --port 3000",
@@ -150,6 +151,82 @@ test("selectListeners keeps individually pinned listeners without pinning the wh
     selected.map((entry) => entry.port),
     [4173]
   );
+});
+
+test("collapseEquivalentListeners merges rows that only differ by equivalent host labels", () => {
+  const collapsed = __testing.collapseEquivalentListeners([
+    createEntry({
+      pid: 1001,
+      port: 18789,
+      host: "127.0.0.1",
+      listenerHosts: ["127.0.0.1"],
+      displayHost: "localhost",
+      kind: "system",
+    }),
+    createEntry({
+      pid: 1001,
+      port: 18789,
+      host: "::1",
+      listenerHosts: ["::1"],
+      displayHost: "localhost",
+      kind: "system",
+    }),
+    createEntry({
+      pid: 1002,
+      port: 5000,
+      host: "*",
+      listenerHosts: ["*"],
+      displayHost: "*",
+      kind: "system",
+    }),
+    createEntry({
+      pid: 1002,
+      port: 5000,
+      host: "*",
+      listenerHosts: ["*"],
+      displayHost: "*",
+      kind: "system",
+    }),
+  ]);
+
+  assert.equal(collapsed.length, 2);
+  assert.equal(collapsed[0].host, "127.0.0.1");
+  assert.deepEqual(collapsed[0].listenerHosts, ["127.0.0.1", "::1"]);
+  assert.equal(collapsed[1].host, "*");
+  assert.deepEqual(collapsed[1].listenerHosts, ["*"]);
+});
+
+test("selectListeners matches saved host aliases for collapsed listeners", () => {
+  const mergedEntry = __testing.collapseEquivalentListeners([
+    createEntry({
+      pid: 1001,
+      port: 18789,
+      host: "127.0.0.1",
+      listenerHosts: ["127.0.0.1"],
+      displayHost: "localhost",
+      kind: "system",
+      projectName: "openclaw-gateway",
+      displayProject: "openclaw-gateway",
+    }),
+    createEntry({
+      pid: 1001,
+      port: 18789,
+      host: "::1",
+      listenerHosts: ["::1"],
+      displayHost: "localhost",
+      kind: "system",
+      projectName: "openclaw-gateway",
+      displayProject: "openclaw-gateway",
+    }),
+  ])[0];
+
+  const selected = selectListeners([mergedEntry], { all: false }, {
+    pinnedListenerKeys: ["host:::1::port:18789"],
+    orderedEntryKeys: ["host:::1::port:18789"],
+  });
+
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].port, 18789);
 });
 
 test("getProjectName falls back to the pnpm dlx package name when cwd is root", () => {

@@ -14,6 +14,7 @@ function createEntry(overrides = {}) {
     ppid: overrides.ppid ?? 1,
     port: overrides.port ?? 3000,
     host: overrides.host ?? "127.0.0.1",
+    listenerHosts: overrides.listenerHosts ?? [overrides.host ?? "127.0.0.1"],
     displayHost: overrides.displayHost ?? overrides.host ?? "127.0.0.1",
     command: overrides.command ?? "node",
     args: overrides.args ?? "pnpm dev --port 3000",
@@ -299,10 +300,101 @@ test("buildVisibleEntries collapses app helper listeners into a single group row
   const visibleEntries = __testing.buildVisibleEntries([devEntry, antigravityHelper, figmaAgent, antigravityLanguageServer], state);
 
   assert.equal(visibleEntries.length, 3);
+  assert.equal(visibleEntries[1].displayProject, "figma_agent");
+  assert.equal(visibleEntries[2].entryType, "app-group");
+  assert.equal(visibleEntries[2].displayProject, "Antigravity");
+  assert.equal(visibleEntries[2].groupCount, 2);
+});
+
+test("buildVisibleEntries moves grouped app rows to the end of the all view", () => {
+  const groupedFirst = createEntry({
+    pid: 2001,
+    port: 59267,
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "Antigravity Helper (Plugin)",
+    displayProject: "Antigravity Helper (Plugin)",
+    displayCommand: "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Plugin).app/Contents/MacOS/Antigravity Helper (Plugin)",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const systemEntry = createEntry({
+    pid: 3001,
+    port: 5000,
+    kind: "system",
+    projectName: "ControlCenter",
+    displayProject: "ControlCenter",
+    displayCommand: "/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const groupedSecond = createEntry({
+    pid: 2002,
+    port: 61473,
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "language_server_macos_arm",
+    displayProject: "language_server_macos_arm",
+    displayCommand: "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const state = createRenderState([], {
+    allListeners: [groupedFirst, systemEntry, groupedSecond],
+    listScope: "all",
+  });
+
+  const visibleEntries = __testing.buildVisibleEntries([groupedFirst, systemEntry, groupedSecond], state);
+
+  assert.deepEqual(
+    visibleEntries.map((entry) => entry.displayProject),
+    ["ControlCenter", "Antigravity"]
+  );
   assert.equal(visibleEntries[1].entryType, "app-group");
-  assert.equal(visibleEntries[1].displayProject, "Antigravity");
-  assert.equal(visibleEntries[1].groupCount, 2);
-  assert.equal(visibleEntries[2].displayProject, "figma_agent");
+});
+
+test("buildVisibleEntries respects pinned host aliases for collapsed listeners", () => {
+  const pinnedHelper = createEntry({
+    pid: 2001,
+    port: 18789,
+    host: "127.0.0.1",
+    listenerHosts: ["127.0.0.1", "::1"],
+    displayHost: "localhost",
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "Antigravity Helper (Plugin)",
+    displayProject: "Antigravity Helper (Plugin)",
+    displayCommand: "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Plugin).app/Contents/MacOS/Antigravity Helper (Plugin)",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const siblingHelper = createEntry({
+    pid: 2002,
+    port: 61473,
+    host: "::1",
+    listenerHosts: ["::1"],
+    displayHost: "localhost",
+    kind: "app",
+    appFamily: "Antigravity",
+    projectName: "language_server_macos_arm",
+    displayProject: "language_server_macos_arm",
+    displayCommand: "/Applications/Antigravity.app/Contents/Resources/app/extensions/antigravity/bin/language_server_macos_arm",
+    displayCwd: "",
+    cwd: "/",
+  });
+  const state = createRenderState([], {
+    allListeners: [pinnedHelper, siblingHelper],
+    listScope: "all",
+    pinnedListenerKeys: ["host:::1::port:18789"],
+  });
+
+  const visibleEntries = __testing.buildVisibleEntries([pinnedHelper, siblingHelper], state);
+
+  assert.deepEqual(
+    visibleEntries.map((entry) => entry.displayProject),
+    ["Antigravity Helper (Plugin)", "language_server_macos_arm"]
+  );
+  assert.ok(visibleEntries.every((entry) => entry.entryType !== "app-group"));
 });
 
 test("requestKillSelectedEntry blocks destructive actions on collapsed app groups", () => {
