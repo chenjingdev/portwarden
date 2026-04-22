@@ -610,3 +610,205 @@ test("handleMainViewKey uses arrows to expand and collapse app groups", () => {
   assert.equal(__testing.handleMainViewKey(state, "\u001b[D", actions), true);
   assert.deepEqual(actionsCalled, ["toggleSelectedAppGroup"]);
 });
+
+// --- graveyard (v0.3 무덤 뷰) ---
+
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+function withTempXdg(fn) {
+  const original = process.env.XDG_CONFIG_HOME;
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "portwarden-grave-"));
+  process.env.XDG_CONFIG_HOME = temp;
+  try { fn(temp); } finally {
+    if (original === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = original;
+  }
+}
+
+test("graveyard: killSelectedEntry captures a revive snapshot for non-pinned entries", () => {
+  withTempXdg(() => {
+    const entry = createEntry({ port: 5173, args: "node vite.js", cwd: "/u/t" });
+    const state = {
+      visibleListeners: [entry],
+      selectedIndex: 0,
+      selectionKey: null,
+      config: {
+        confirmActions: false,
+        pinnedListenerKeys: [], // NOT pinned — passes pin-kill guard
+        orderedEntryKeys: [],
+        revivablePins: {},
+      },
+      allListeners: [entry],
+      pendingAction: null,
+      error: "",
+      status: "",
+      expandedAppGroups: new Set(),
+    };
+    const originalKill = process.kill;
+    process.kill = () => {};
+    try {
+      __testing.killSelectedEntry(state, "SIGTERM", () => {}, () => {});
+    } finally { process.kill = originalKill; }
+
+    const key = getEntryListenerKey(entry);
+    assert.ok(state.config.revivablePins[key], "revivablePins must be populated for the killed entry");
+    assert.equal(state.config.revivablePins[key].cmd, "node vite.js");
+    assert.ok(state.status.includes("무덤"));
+  });
+});
+
+test("graveyard: pin-kill guard still protects pinned entries (no capture, no kill)", () => {
+  withTempXdg(() => {
+    const entry = createEntry({ port: 3306 });
+    const state = {
+      visibleListeners: [entry],
+      selectedIndex: 0,
+      selectionKey: null,
+      config: {
+        confirmActions: false,
+        pinnedListenerKeys: [getEntryListenerKey(entry)],
+        orderedEntryKeys: [getEntryListenerKey(entry)],
+        revivablePins: {},
+      },
+      allListeners: [entry],
+      pendingAction: null,
+      error: "",
+      status: "",
+      expandedAppGroups: new Set(),
+    };
+    const originalKill = process.kill;
+    let killed = false;
+    process.kill = () => { killed = true; };
+    try {
+      __testing.killSelectedEntry(state, "SIGTERM", () => {}, () => {});
+    } finally { process.kill = originalKill; }
+
+    assert.equal(killed, false);
+    assert.deepEqual(state.config.revivablePins, {});
+    assert.ok(state.error.includes("Pinned"));
+  });
+});
+
+test("graveyard: openGraveyardView switches view and getGraveyardEntries returns records sorted newest-first", () => {
+  const state = {
+    view: "list",
+    graveyardSelectedIndex: 0,
+    pendingAction: null,
+    allListeners: [],
+    config: {
+      revivablePins: {
+        "host:*::port:3000": { cwd: "/a", cmd: "x", capturedAt: "2026-04-22T10:00:00Z", source: "auto" },
+        "host:*::port:5173": { cwd: "/b", cmd: "y", capturedAt: "2026-04-22T12:00:00Z", source: "auto" },
+      },
+    },
+  };
+  __testing.openGraveyardView(state);
+  assert.equal(state.view, "graveyard");
+  const entries = __testing.getGraveyardEntries(state);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].port, 5173, "newest first");
+  assert.equal(entries[1].port, 3000);
+});
+
+test("graveyard: live-port entries are marked alive; absent ports marked dead", () => {
+  const state = {
+    allListeners: [{ port: 5173, host: "127.0.0.1", listenerHosts: ["127.0.0.1"] }],
+    config: {
+      revivablePins: {
+        "host:::1::port:5173": { cwd: "/a", cmd: "x", capturedAt: "2026-04-22T12:00:00Z", source: "auto" },
+        "host:*::port:3000":   { cwd: "/b", cmd: "y", capturedAt: "2026-04-22T11:00:00Z", source: "auto" },
+      },
+    },
+  };
+  const entries = __testing.getGraveyardEntries(state);
+  const vite = entries.find((e) => e.port === 5173);
+  const three = entries.find((e) => e.port === 3000);
+  assert.equal(vite.alive, true);
+  assert.equal(three.alive, false);
+});
+
+test("graveyard: dropSelectedGhost removes the record from revivablePins and persists", () => {
+  withTempXdg(() => {
+    const { loadConfig } = require("../lib/config");
+    const state = {
+      graveyardSelectedIndex: 0,
+      allListeners: [],
+      config: {
+        browser: "",
+        confirmActions: false,
+        pinnedListenerKeys: [],
+        orderedEntryKeys: [],
+        revivablePins: {
+          "host:*::port:9999": { cwd: "/a", cmd: "x", capturedAt: "2026-04-22T12:00:00Z", source: "auto" },
+        },
+      },
+      error: "",
+      status: "",
+    };
+    __testing.dropSelectedGhost(state);
+    assert.deepEqual(state.config.revivablePins, {});
+    const onDisk = loadConfig();
+    assert.deepEqual(onDisk.revivablePins, {});
+  });
+});
+
+test("graveyard: reviveSelectedGhost calls reviveSnapshot (dry-run) without crashing", () => {
+  const originalEnv = process.env.DEV_PORTS_SPAWN_DRY_RUN;
+  process.env.DEV_PORTS_SPAWN_DRY_RUN = "1";
+  try {
+    const state = {
+      graveyardSelectedIndex: 0,
+      allListeners: [],
+      config: {
+        revivablePins: {
+          "host:*::port:3000": { cwd: "/x", cmd: "node a.js", capturedAt: "2026-04-22T12:00:00Z", source: "auto" },
+        },
+      },
+      error: "",
+      status: "",
+    };
+    let refreshCalled = false;
+    __testing.reviveSelectedGhost(state, () => { refreshCalled = true; });
+    assert.ok(state.status.includes("Revive"));
+    assert.equal(state.error, "");
+    assert.equal(refreshCalled, true);
+  } finally {
+    if (originalEnv === undefined) delete process.env.DEV_PORTS_SPAWN_DRY_RUN;
+    else process.env.DEV_PORTS_SPAWN_DRY_RUN = originalEnv;
+  }
+});
+
+test("graveyard: handleMainViewKey routes 'g' to openGraveyard action", () => {
+  const called = [];
+  const actions = new Proxy({}, { get: (_t, p) => () => { called.push(p); } });
+  const state = createRenderState([createEntry()], { pinnedListenerKeys: [] });
+  __testing.handleMainViewKey(state, "g", actions);
+  assert.deepEqual(called, ["openGraveyard"]);
+});
+
+test("graveyard: handleGraveyardViewKey routes r/d/j/k/esc correctly", () => {
+  const called = [];
+  const actions = new Proxy({}, { get: (_t, p) => () => { called.push(p); } });
+  const state = { view: "graveyard", graveyardSelectedIndex: 0, allListeners: [], config: { revivablePins: {} } };
+  __testing.handleGraveyardViewKey(state, "r", actions);
+  __testing.handleGraveyardViewKey(state, "d", actions);
+  __testing.handleGraveyardViewKey(state, "j", actions);
+  __testing.handleGraveyardViewKey(state, "k", actions);
+  __testing.handleGraveyardViewKey(state, "\u001b", actions); // esc
+  assert.deepEqual(called, [
+    "reviveSelectedGhost",
+    "dropSelectedGhost",
+    "moveGraveyardDown",
+    "moveGraveyardUp",
+    "closeGraveyard",
+  ]);
+});
+
+test("graveyard: renderGraveyardScreen shows empty-state when no revivablePins", () => {
+  const state = { graveyardSelectedIndex: 0, allListeners: [], config: { revivablePins: {} } };
+  const lines = __testing.renderGraveyardScreen(state, 120, 24).map(stripAnsi);
+  assert.ok(lines.some((line) => line.includes("GRAVEYARD")));
+  assert.ok(lines.some((line) => line.includes("아직") && line.includes("죽인")));
+});

@@ -254,3 +254,44 @@ test("inferAppFamily groups desktop helper processes by the host app", () => {
 
   assert.equal(__testing.inferAppFamily(details), "Antigravity");
 });
+
+const { buildReviveLogPath, captureReviveSnapshot, reviveSnapshot } = require("../lib/ports");
+
+test("captureReviveSnapshot returns null when args is empty", () => {
+  const snap = captureReviveSnapshot(createEntry({ args: "" }));
+  assert.equal(snap, null);
+});
+
+test("captureReviveSnapshot builds a record with cwd/cmd/capturedAt/source", () => {
+  const snap = captureReviveSnapshot(createEntry({ port: 5173, host: "127.0.0.1", cwd: "/u/t", args: "vite" }));
+  assert.equal(snap.listenerKey, "host:127.0.0.1::port:5173");
+  assert.equal(snap.record.cmd, "vite");
+  assert.equal(snap.record.cwd, "/u/t");
+  assert.equal(snap.record.source, "auto");
+  assert.ok(typeof snap.record.capturedAt === "string" && snap.record.capturedAt.length > 0);
+});
+
+test("buildReviveLogPath produces a slug based on cwd tail + port", () => {
+  const logPath = buildReviveLogPath({
+    listenerKey: "host:127.0.0.1::port:5173",
+    record: { cwd: "/Users/test/dev/sample", cmd: "vite", capturedAt: "x", source: "auto" },
+  });
+  assert.ok(logPath.endsWith("/sample-5173.log"));
+});
+
+test("reviveSnapshot dry-run returns command without spawning a child", () => {
+  const originalEnv = process.env.DEV_PORTS_SPAWN_DRY_RUN;
+  process.env.DEV_PORTS_SPAWN_DRY_RUN = "1";
+  try {
+    const result = reviveSnapshot(
+      { listenerKey: "host:*::port:3000", record: { cwd: "/x", cmd: "node a.js", capturedAt: "x", source: "auto" } },
+      "/tmp/test.log"
+    );
+    assert.equal(result.pid, null);
+    assert.ok(result.command.includes("cd '/x'"));
+    assert.ok(result.command.includes("node a.js"));
+  } finally {
+    if (originalEnv === undefined) delete process.env.DEV_PORTS_SPAWN_DRY_RUN;
+    else process.env.DEV_PORTS_SPAWN_DRY_RUN = originalEnv;
+  }
+});
