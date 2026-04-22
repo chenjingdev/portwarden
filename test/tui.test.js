@@ -788,14 +788,14 @@ test("graveyard: handleMainViewKey routes 'g' to openGraveyard action", () => {
   assert.deepEqual(called, ["openGraveyard"]);
 });
 
-test("graveyard: handleGraveyardViewKey routes r/d/j/k/esc correctly", () => {
+test("graveyard: handleGraveyardViewKey routes r/d/arrows/esc correctly", () => {
   const called = [];
   const actions = new Proxy({}, { get: (_t, p) => () => { called.push(p); } });
   const state = { view: "graveyard", graveyardSelectedIndex: 0, allListeners: [], config: { revivablePins: {} } };
   __testing.handleGraveyardViewKey(state, "r", actions);
   __testing.handleGraveyardViewKey(state, "d", actions);
-  __testing.handleGraveyardViewKey(state, "j", actions);
-  __testing.handleGraveyardViewKey(state, "k", actions);
+  __testing.handleGraveyardViewKey(state, "\u001b[B", actions); // down arrow
+  __testing.handleGraveyardViewKey(state, "\u001b[A", actions); // up arrow
   __testing.handleGraveyardViewKey(state, "\u001b", actions); // esc
   assert.deepEqual(called, [
     "reviveSelectedGhost",
@@ -804,6 +804,51 @@ test("graveyard: handleGraveyardViewKey routes r/d/j/k/esc correctly", () => {
     "moveGraveyardUp",
     "closeGraveyard",
   ]);
+});
+
+test("graveyard: j and k no longer trigger navigation (removed in favor of arrow keys)", () => {
+  const called = [];
+  const actions = new Proxy({}, { get: (_t, p) => () => { called.push(p); } });
+  const state = { view: "graveyard", graveyardSelectedIndex: 0, allListeners: [], config: { revivablePins: {} } };
+  __testing.handleGraveyardViewKey(state, "j", actions);
+  __testing.handleGraveyardViewKey(state, "k", actions);
+  assert.ok(!called.includes("moveGraveyardDown"));
+  assert.ok(!called.includes("moveGraveyardUp"));
+});
+
+test("graveyard: reviveSelectedGhost removes the ghost from revivablePins on success", () => {
+  withTempXdg(() => {
+    const { loadConfig } = require("../lib/config");
+    const originalEnv = process.env.DEV_PORTS_SPAWN_DRY_RUN;
+    process.env.DEV_PORTS_SPAWN_DRY_RUN = "1";
+    try {
+      const state = {
+        graveyardSelectedIndex: 0,
+        allListeners: [],
+        config: {
+          browser: "",
+          confirmActions: false,
+          pinnedListenerKeys: [],
+          orderedEntryKeys: [],
+          revivablePins: {
+            "host:*::port:3000": { cwd: "/x", cmd: "node a.js", capturedAt: "2026-04-22T12:00:00Z", source: "auto" },
+            "host:*::port:5173": { cwd: "/y", cmd: "vite",     capturedAt: "2026-04-22T13:00:00Z", source: "auto" },
+          },
+        },
+        error: "",
+        status: "",
+      };
+      __testing.reviveSelectedGhost(state, () => {});
+      assert.equal(state.config.revivablePins["host:*::port:5173"], undefined);
+      assert.ok(state.config.revivablePins["host:*::port:3000"]);
+      const onDisk = loadConfig();
+      assert.equal(onDisk.revivablePins["host:*::port:5173"], undefined);
+      assert.ok(onDisk.revivablePins["host:*::port:3000"]);
+    } finally {
+      if (originalEnv === undefined) delete process.env.DEV_PORTS_SPAWN_DRY_RUN;
+      else process.env.DEV_PORTS_SPAWN_DRY_RUN = originalEnv;
+    }
+  });
 });
 
 test("graveyard: renderGraveyardScreen shows empty-state when no revivablePins", () => {
