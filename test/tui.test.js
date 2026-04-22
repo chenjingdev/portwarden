@@ -812,3 +812,87 @@ test("graveyard: renderGraveyardScreen shows empty-state when no revivablePins",
   assert.ok(lines.some((line) => line.includes("GRAVEYARD")));
   assert.ok(lines.some((line) => line.includes("아직") && line.includes("죽인")));
 });
+
+test("pin: toggleSelectedEntryPinned appends new pin to the end of existing pinned list", () => {
+  withTempXdg(() => {
+    const alpha = createEntry({ port: 3000, pid: 100, host: "127.0.0.1" });
+    const beta = createEntry({ port: 4000, pid: 200, host: "127.0.0.1" });
+    const gamma = createEntry({ port: 5000, pid: 300, host: "127.0.0.1" });
+    const alphaKey = getEntryListenerKey(alpha);
+    const betaKey = getEntryListenerKey(beta);
+    const gammaKey = getEntryListenerKey(gamma);
+
+    const state = {
+      visibleListeners: [alpha, beta, gamma],
+      selectedIndex: 2, // select gamma (unpinned) to pin it
+      selectionKey: null,
+      config: {
+        confirmActions: false,
+        pinnedListenerKeys: [alphaKey, betaKey],
+        orderedEntryKeys: [alphaKey, betaKey, gammaKey],
+        revivablePins: {},
+      },
+      allListeners: [alpha, beta, gamma],
+      pendingAction: null,
+      error: "",
+      status: "",
+      expandedAppGroups: new Set(),
+    };
+
+    __testing.toggleSelectedEntryPinned(state);
+
+    // gamma should appear AFTER alpha and beta, not before.
+    assert.deepEqual(state.config.pinnedListenerKeys, [alphaKey, betaKey, gammaKey]);
+    assert.ok(state.status.startsWith("Pinned:"), `status was ${JSON.stringify(state.status)}`);
+  });
+});
+
+test("move: pruneRevivablePinsForMovedEntry clears graveyard entry for moved listener key", () => {
+  withTempXdg(() => {
+    const { loadConfig } = require("../lib/config");
+    const entry = createEntry({ port: 3000, host: "127.0.0.1" });
+    const key = getEntryListenerKey(entry);
+    const state = {
+      config: {
+        browser: "",
+        confirmActions: false,
+        pinnedListenerKeys: [],
+        orderedEntryKeys: [],
+        revivablePins: {
+          [key]: { cwd: "/tmp", cmd: "pnpm dev", capturedAt: "2026-04-22T09:00:00Z", source: "auto" },
+          "host:*::port:9999": { cwd: "/x", cmd: "z", capturedAt: "2026-04-22T10:00:00Z", source: "auto" },
+        },
+      },
+      error: "",
+    };
+
+    __testing.pruneRevivablePinsForMovedEntry(state, entry);
+
+    // Moved key dropped, unrelated key preserved
+    assert.equal(state.config.revivablePins[key], undefined);
+    assert.ok(state.config.revivablePins["host:*::port:9999"]);
+    const onDisk = loadConfig();
+    assert.equal(onDisk.revivablePins[key], undefined);
+    assert.ok(onDisk.revivablePins["host:*::port:9999"]);
+  });
+});
+
+test("move: pruneRevivablePinsForMovedEntry is a no-op when listener key not graveyarded", () => {
+  withTempXdg(() => {
+    const entry = createEntry({ port: 3000, host: "127.0.0.1" });
+    const state = {
+      config: {
+        browser: "",
+        confirmActions: false,
+        pinnedListenerKeys: [],
+        orderedEntryKeys: [],
+        revivablePins: {
+          "host:*::port:9999": { cwd: "/x", cmd: "z", capturedAt: "2026-04-22T10:00:00Z", source: "auto" },
+        },
+      },
+      error: "",
+    };
+    __testing.pruneRevivablePinsForMovedEntry(state, entry);
+    assert.ok(state.config.revivablePins["host:*::port:9999"]);
+  });
+});
