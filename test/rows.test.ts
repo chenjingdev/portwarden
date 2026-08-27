@@ -41,7 +41,7 @@ describe('buildVisibleRows', () => {
     expect(expanded.map(({type}) => type)).toEqual(['group', 'listener', 'listener']);
   });
 
-  it('keeps an app group at its first sorted position instead of moving it to the bottom', () => {
+  it('keeps ordinary and pinned rows in place and moves collapsed app groups to the bottom', () => {
     const entries = [
       listener({pid: 1, port: 3000, kind: 'dev', displayProject: 'alpha'}),
       listener({pid: 10, port: 5001, kind: 'app', appFamily: 'Ollama'}),
@@ -53,7 +53,24 @@ describe('buildVisibleRows', () => {
       expandedGroups: new Set(),
       pinnedListenerKeys: [],
     });
-    expect(rows.map(({type}) => type)).toEqual(['listener', 'group', 'listener']);
+    expect(rows.map(({type}) => type)).toEqual(['listener', 'listener', 'group']);
+  });
+
+  it('keeps pinned app listeners individually selectable instead of collapsing them into a group', () => {
+    const pinned = listener({pid: 9, port: 4999, kind: 'app', appFamily: 'Ollama'});
+    const entries = [
+      pinned,
+      listener({pid: 10, port: 5001, kind: 'app', appFamily: 'Ollama'}),
+      listener({pid: 11, port: 5002, kind: 'app', appFamily: 'Ollama'}),
+    ];
+    const rows = buildVisibleRows(entries, [], {
+      all: true,
+      expandedGroups: new Set(),
+      pinnedListenerKeys: [`host:${pinned.host}::port:${pinned.port}`],
+    });
+
+    expect(rows.map(({type}) => type)).toEqual(['listener', 'group']);
+    expect(rows[0]).toMatchObject({type: 'listener', listener: pinned});
   });
 
   it('filters by project or port and expands matching groups for discoverability', () => {

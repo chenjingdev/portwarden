@@ -229,9 +229,9 @@ async function runTui(configRepository: ConfigRepository, options: CliOptions): 
         configRepository={configRepository}
         initialAll={options.all}
         initialZombies={options.zombies}
-        browserOverride={options.browser}
+        browserOverride={options.browser ?? process.env.PORTWARDEN_BROWSER ?? process.env.DEV_PORTS_BROWSER}
       />,
-      {exitOnCtrlC: true, incrementalRendering: true},
+      {exitOnCtrlC: false, incrementalRendering: true},
     );
     process.once('SIGTERM', terminate);
     await instance.waitUntilExit();

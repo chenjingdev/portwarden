@@ -177,10 +177,26 @@ describe('stopListener safety', () => {
     expect(kill).not.toHaveBeenCalled();
   });
 
+  it('honors a same-PID pin added while the final listener snapshot is collected', async () => {
+    const selected = listener();
+    const sibling = listener({port: 3_001, args: selected.args, displayCommand: selected.displayCommand});
+    const config = repository();
+    const collect = vi.fn<Collect>(async () => {
+      config.update({pinnedListenerKeys: [listenerKey(sibling)]});
+      return [selected, sibling];
+    });
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(config, {collect, kill});
+
+    await expect(actions.stopListener(selected, 'SIGTERM')).rejects.toMatchObject({code: 'PINNED'});
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['PID', {pid: 1_001}],
     ['command', {args: 'vite --port 3000 --host 0.0.0.0'}],
     ['cwd', {cwd: '/Users/test/dev/other'}],
+    ['host', {host: '0.0.0.0'}],
     ['executable', {executable: '/tmp/replaced-vite'}],
     ['owner', {uid: (typeof process.getuid === 'function' ? process.getuid() : 1_000) + 1}],
     ['start time', {startTime: new Date('2026-08-27T00:59:00.000Z')}],
@@ -254,6 +270,8 @@ describe('stopListener safety', () => {
     await expect(actions.stopListener(current, 'SIGTERM')).resolves.toMatchObject({
       port: current.port,
       pid: current.pid,
+      graveyardSaved: true,
+      message: expect.stringContaining('Saved a revive record in the graveyard.'),
     });
 
     expect(kill).toHaveBeenCalledWith(current.pid, 'SIGTERM');
@@ -267,6 +285,27 @@ describe('stopListener safety', () => {
     })]);
   });
 
+  it('reports a verified stop as successful when saving its graveyard record fails', async () => {
+    const current = listener();
+    const config = repository();
+    vi.spyOn(config, 'update').mockImplementationOnce(() => {
+      throw new Error('read-only config');
+    });
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(config, {
+      collect: sequentialCollector([current], []),
+      kill,
+    });
+
+    await expect(actions.stopListener(current, 'SIGTERM')).resolves.toMatchObject({
+      port: current.port,
+      graveyardSaved: false,
+      warning: expect.stringContaining('Revive record was not saved'),
+    });
+    expect(kill).toHaveBeenCalledWith(current.pid, 'SIGTERM');
+    expect(config.get().graveyard).toEqual([]);
+  });
+
   it('stops a sensitive command without persisting its credentials', async () => {
     const current = listener({args: 'API_TOKEN=do-not-save vite --port 3000'});
     const config = repository();
@@ -276,7 +315,10 @@ describe('stopListener safety', () => {
       kill,
     });
 
-    await actions.stopListener(current, 'SIGKILL');
+    await expect(actions.stopListener(current, 'SIGKILL')).resolves.toMatchObject({
+      graveyardSaved: false,
+      message: expect.stringContaining('No revive record was saved'),
+    });
 
     expect(kill).toHaveBeenCalledWith(current.pid, 'SIGKILL');
     expect(config.get().graveyard).toEqual([]);
@@ -318,6 +360,106 @@ describe('zombie stop outcomes', () => {
 });
 
 describe('moveListener safety', () => {
+  it('rejects moving port 65535 before looking for or launching a target', async () => {
+    const original = listener({port: 65_535, args: 'vite --port 65535'});
+    const findPort = vi.fn<FindPort>();
+    const launch = vi.fn<Launch>();
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([original]),
+      getPort: findPort,
+      launch,
+    });
+
+    await expect(actions.moveListener(original)).rejects.toMatchObject({code: 'PORT_BUSY'});
+    expect(findPort).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it('refuses to move a process when the same PID owns another pinned listener', async () => {
+    const original = listener();
+    const pinnedSibling = listener({
+      port: 3_001,
+      args: original.args,
+      displayCommand: original.displayCommand,
+    });
+    const config = repository({pinnedListenerKeys: [listenerKey(pinnedSibling)]});
+    const launch = vi.fn<Launch>();
+    const findPort = vi.fn<FindPort>();
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(config, {
+      collect: sequentialCollector([original, pinnedSibling]),
+      getPort: findPort,
+      launch,
+      kill,
+    });
+
+    await expect(actions.moveListener(original)).rejects.toMatchObject({
+      name: 'ActionError',
+      code: 'PINNED',
+      message: expect.stringContaining('pinned port 3001'),
+    });
+    expect(findPort).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('protects a pinned same-port binding on a different host owned by the same PID', async () => {
+    const original = listener();
+    const pinnedSibling = listener({
+      host: '0.0.0.0',
+      listenerHosts: ['0.0.0.0'],
+      displayHost: 'all',
+      args: original.args,
+      displayCommand: original.displayCommand,
+    });
+    const config = repository({pinnedListenerKeys: [listenerKey(pinnedSibling)]});
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(config, {
+      collect: sequentialCollector([original, pinnedSibling]),
+      getPort: vi.fn<FindPort>(),
+      launch: vi.fn<Launch>(),
+      kill,
+    });
+
+    await expect(actions.moveListener(original)).rejects.toMatchObject({code: 'PINNED'});
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('rechecks pinned siblings immediately before stopping the original after launch', async () => {
+    const original = listener();
+    const sibling = listener({port: 3_002, args: original.args, displayCommand: original.displayCommand});
+    const moved = listener({pid: 2_001, port: 3_001, args: 'vite --port 3001', displayCommand: 'vite --port 3001'});
+    const launchedPid = 2_000;
+    const config = repository();
+    let collectionCount = 0;
+    const collect = vi.fn<Collect>(async () => {
+      collectionCount += 1;
+      if (collectionCount === 1) return [original, sibling];
+      if (collectionCount === 2) {
+        config.update({pinnedListenerKeys: [listenerKey(sibling)]});
+        return [original, sibling, moved];
+      }
+      return collectionCount <= 4 ? [original, sibling, moved] : [original, sibling];
+    });
+    const kill = vi.fn<Kill>();
+    const rollbackKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const actions = new PortwardenActions(config, {
+      collect,
+      kill,
+      getPort: vi.fn<FindPort>(async () => moved.port),
+      launch: vi.fn<Launch>(() => launchedProcess(launchedPid)),
+      processProvider: async () => [
+        processInfo(launchedPid, 1),
+        processInfo(moved.pid, launchedPid),
+      ],
+    });
+
+    await expect(actions.moveListener(original)).rejects.toMatchObject({code: 'PINNED'});
+    expect(kill).not.toHaveBeenCalled();
+    expect(rollbackKill).toHaveBeenCalledWith(moved.pid, 'SIGTERM');
+    expect(rollbackKill).toHaveBeenCalledWith(-launchedPid, 'SIGTERM');
+  });
+
   it('does not kill the original until a matching child listener is verified', async () => {
     const original = listener();
     const moved = listener({
@@ -375,6 +517,32 @@ describe('moveListener safety', () => {
     expect(config.get().orderedEntryKeys).toEqual([listenerKey(moved)]);
   });
 
+  it('returns the moved listener when only the post-move config update fails', async () => {
+    const original = listener();
+    const moved = listener({pid: 2_001, port: 3_001, args: 'vite --port 3001'});
+    const config = repository();
+    vi.spyOn(config, 'update').mockImplementationOnce(() => {
+      throw new Error('read-only config');
+    });
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(config, {
+      collect: sequentialCollector([original], [original, moved], [original, moved], [moved]),
+      kill,
+      getPort: vi.fn<FindPort>(async () => moved.port),
+      launch: vi.fn<Launch>(() => launchedProcess(2_000)),
+      processProvider: async () => [
+        processInfo(2_000, 1),
+        processInfo(moved.pid, 2_000),
+      ],
+    });
+
+    await expect(actions.moveListener(original)).resolves.toMatchObject({
+      listener: moved,
+      warning: expect.stringContaining('Saved pins/order were not updated'),
+    });
+    expect(kill).toHaveBeenCalledWith(original.pid, 'SIGTERM');
+  });
+
   it('rejects an unrelated same-command listener that races onto the selected port', async () => {
     vi.useFakeTimers();
     const original = listener();
@@ -421,6 +589,7 @@ describe('moveListener safety', () => {
       [original, moved],
       [original, moved],
       [original, moved],
+      [original],
     );
     const originalKill = vi.fn<Kill>(() => {
       throw new Error('EPERM');
@@ -437,9 +606,55 @@ describe('moveListener safety', () => {
       ],
     });
 
-    await expect(actions.moveListener(original)).rejects.toMatchObject({code: 'STOP_FAILED'});
+    await expect(actions.moveListener(original)).rejects.toMatchObject({
+      code: 'STOP_FAILED',
+      message: expect.stringContaining('rollback was verified'),
+    });
     expect(rollbackKill).toHaveBeenCalledWith(moved.pid, 'SIGTERM');
     expect(rollbackKill).toHaveBeenCalledWith(-launchedPid, 'SIGTERM');
+  });
+
+  it('escalates rollback to SIGKILL when the verified new listener ignores SIGTERM', async () => {
+    vi.useFakeTimers();
+    const original = listener();
+    const launchedPid = 2_000;
+    const moved = listener({pid: 2_001, port: 3_001, args: 'vite --port 3001'});
+    let forceSent = false;
+    const rollbackKill = vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 'SIGKILL') forceSent = true;
+      return true;
+    });
+    let collectionCount = 0;
+    const collect = vi.fn<Collect>(async () => {
+      collectionCount += 1;
+      if (collectionCount === 1) return [original];
+      if (collectionCount === 2 || collectionCount === 3) return [original, moved];
+      return forceSent ? [original] : [original, moved];
+    });
+    const actions = new PortwardenActions(repository(), {
+      collect,
+      kill: vi.fn<Kill>(() => {
+        throw new Error('EPERM');
+      }),
+      getPort: vi.fn<FindPort>(async () => moved.port),
+      launch: vi.fn<Launch>(() => launchedProcess(launchedPid)),
+      processProvider: async () => [
+        processInfo(launchedPid, 1),
+        processInfo(moved.pid, launchedPid),
+      ],
+    });
+
+    const pending = actions.moveListener(original);
+    const rejection = expect(pending).rejects.toMatchObject({
+      code: 'STOP_FAILED',
+      message: expect.stringContaining('rollback was verified'),
+    });
+    await vi.runAllTimersAsync();
+    await rejection;
+
+    expect(rollbackKill).toHaveBeenCalledWith(moved.pid, 'SIGTERM');
+    expect(rollbackKill).toHaveBeenCalledWith(moved.pid, 'SIGKILL');
+    expect(rollbackKill).toHaveBeenCalledWith(-launchedPid, 'SIGKILL');
   });
 
   it('rolls back a mismatched child and preserves the original listener', async () => {
@@ -496,7 +711,14 @@ describe('moveListener safety', () => {
       args: 'vite --port 9999',
     });
     const launch = vi.fn<Launch>(() => launchedProcess(wrongPortCommand.pid));
-    const rollbackKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    let forceSent = false;
+    const rollbackKill = vi.spyOn(process, 'kill').mockImplementation((_pid, signal) => {
+      if (signal === 'SIGKILL') forceSent = true;
+      if (signal === 0 && forceSent) {
+        throw Object.assign(new Error('no such process group'), {code: 'ESRCH'});
+      }
+      return true;
+    });
     const actions = new PortwardenActions(repository(), {
       collect: sequentialCollector([original], [original, wrongPortCommand]),
       kill: vi.fn<Kill>(),
@@ -505,10 +727,14 @@ describe('moveListener safety', () => {
     });
 
     const pending = actions.moveListener(original);
-    const rejection = expect(pending).rejects.toMatchObject({code: 'START_FAILED'});
+    const rejection = expect(pending).rejects.toMatchObject({
+      code: 'START_FAILED',
+      message: expect.stringContaining('rollback was verified'),
+    });
     await vi.runAllTimersAsync();
     await rejection;
     expect(rollbackKill).toHaveBeenCalledWith(-wrongPortCommand.pid, 'SIGTERM');
+    expect(rollbackKill).toHaveBeenCalledWith(-wrongPortCommand.pid, 'SIGKILL');
   });
 });
 
@@ -554,6 +780,26 @@ describe('graveyard actions', () => {
     matchingCollection.resolve([revived]);
     await expect(pending).resolves.toMatchObject({listener: revived, port: record.port, pid: revived.pid});
     expect(config.get().graveyard).toEqual([]);
+  });
+
+  it('returns the revived listener when only removing its graveyard record fails', async () => {
+    const record = graveyardRecord();
+    const revived = listener({pid: 3_000});
+    const config = repository({graveyard: [record]});
+    vi.spyOn(config, 'update').mockImplementationOnce(() => {
+      throw new Error('read-only config');
+    });
+    const actions = new PortwardenActions(config, {
+      collect: sequentialCollector([], [revived]),
+      getPort: vi.fn<FindPort>(async () => record.port),
+      launch: vi.fn<Launch>(() => launchedProcess(revived.pid)),
+    });
+
+    await expect(actions.revive(record)).resolves.toMatchObject({
+      listener: revived,
+      warning: expect.stringContaining('Graveyard record was not removed'),
+    });
+    expect(config.get().graveyard).toEqual([record]);
   });
 
   it('retries a transient exact-port availability race before reviving', async () => {

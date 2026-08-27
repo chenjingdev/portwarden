@@ -15,6 +15,7 @@ import {
   type CommandSnapshot,
 } from './commands.js';
 import {
+  canonicalHost,
   collectListeners,
   listenerKey,
   listenerKeys,
@@ -28,10 +29,12 @@ export type StopSignal = 'SIGTERM' | 'SIGKILL';
 
 export interface ActionOutcome {
   message: string;
+  warning?: string;
   listener?: ListenerEntry;
   port?: number;
   pid?: number;
   logPath?: string;
+  graveyardSaved?: boolean;
 }
 
 export interface ActionDependencies {
@@ -90,6 +93,11 @@ export class PortwardenActions {
   /** Revalidate a listener without changing process or config state. */
   async validateListener(entry: ListenerEntry): Promise<ListenerEntry> {
     const {current, listeners} = await this.requireCurrentListenerSnapshot(entry);
+    this.assertStoppableListener(current, listeners);
+    return current;
+  }
+
+  private assertStoppableListener(current: ListenerEntry, listeners: readonly ListenerEntry[]): void {
     const config = this.configRepository.get();
     const pinnedSibling = listeners.find((listener) =>
       listener.pid === current.pid && isPinned(listener, config),
@@ -100,7 +108,6 @@ export class PortwardenActions {
         'PINNED',
       );
     }
-    return current;
   }
 
   async stopListener(entry: ListenerEntry, signal: StopSignal): Promise<ActionOutcome> {
@@ -109,10 +116,8 @@ export class PortwardenActions {
       throw new ActionError(`Port ${entry.port} is pinned. Unpin it before stopping.`, 'PINNED');
     }
 
-    const current = await this.validateListener(entry);
-    if (isPinned(current, this.configRepository.get())) {
-      throw new ActionError(`Port ${current.port} was pinned before the stop could begin.`, 'PINNED');
-    }
+    const {current, listeners} = await this.requireCurrentListenerSnapshot(entry);
+    this.assertStoppableListener(current, listeners);
     const graveyardRecord = current.kind === 'dev' ? captureGraveyardRecord(current, this.now()) : null;
     try {
       this.kill(current.pid, signal);
@@ -125,17 +130,33 @@ export class PortwardenActions {
       throw new ActionError(`PID ${current.pid} is still listening on port ${current.port}.`, 'STOP_FAILED');
     }
 
+    let graveyardSaved = false;
+    let graveyardSaveError = '';
     if (graveyardRecord) {
-      const nextConfig = this.configRepository.get();
-      this.configRepository.update({
-        graveyard: [graveyardRecord, ...nextConfig.graveyard.filter(({listenerKey: key}) => key !== graveyardRecord.listenerKey)].slice(0, 100),
-      });
+      try {
+        const nextConfig = this.configRepository.get();
+        this.configRepository.update({
+          graveyard: [graveyardRecord, ...nextConfig.graveyard.filter(({listenerKey: key}) => key !== graveyardRecord.listenerKey)].slice(0, 100),
+        });
+        graveyardSaved = true;
+      } catch (error) {
+        graveyardSaveError = sanitizeText(error instanceof Error ? error.message : String(error));
+      }
     }
 
+    const graveyardMessage = current.kind !== 'dev'
+      ? ''
+      : graveyardSaved
+        ? ' Saved a revive record in the graveyard.'
+        : graveyardSaveError
+          ? ''
+        : ' No revive record was saved because the command cannot be replayed safely.';
     return {
-      message: `Stopped ${current.displayProject || current.command} on port ${current.port} (${signal}).`,
+      message: `Stopped ${current.displayProject || current.command} on port ${current.port} (${signal}).${graveyardMessage}`,
+      warning: graveyardSaveError ? `Revive record was not saved: ${graveyardSaveError}.` : undefined,
       port: current.port,
       pid: current.pid,
+      graveyardSaved: current.kind === 'dev' ? graveyardSaved : undefined,
     };
   }
 
@@ -167,7 +188,10 @@ export class PortwardenActions {
   }
 
   async moveListener(entry: ListenerEntry): Promise<ActionOutcome> {
-    const current = await this.requireCurrentListener(entry);
+    const current = await this.requireMovableListener(entry);
+    if (current.port >= 65_535) {
+      throw new ActionError('No higher port is available after 65535.', 'PORT_BUSY');
+    }
     const snapshot = parseCommandSnapshot(current.args);
     if (!snapshot || !isSnapshotReplaySafe(snapshot)) {
       throw new ActionError('The launch command cannot be replayed safely.', 'UNSAFE_COMMAND');
@@ -193,34 +217,49 @@ export class PortwardenActions {
         timeoutMs: 12_000,
       });
     } catch (error) {
-      await rollbackLaunchedProcess(child.pid, undefined, this.collect);
-      throw error;
+      const rolledBack = await rollbackLaunchedProcess(child.pid, undefined, this.collect);
+      throw withRollbackResult(error, 'START_FAILED', rolledBack);
     }
 
     try {
-      await this.requireCurrentListener(current);
-      this.kill(current.pid, 'SIGTERM');
+      const finalSnapshot = await this.requireCurrentListenerSnapshot(current);
+      this.assertMovableListener(finalSnapshot.current, finalSnapshot.listeners);
+      this.kill(finalSnapshot.current.pid, 'SIGTERM');
     } catch (error) {
-      await rollbackLaunchedProcess(child.pid, started, this.collect);
-      if (error instanceof ActionError) throw error;
+      const rolledBack = await rollbackLaunchedProcess(child.pid, started, this.collect);
+      if (error instanceof ActionError) throw withRollbackResult(error, error.code, rolledBack);
       const message = sanitizeText(error instanceof Error ? error.message : String(error));
-      throw new ActionError(`Could not signal original PID ${current.pid}: ${message}`, 'STOP_FAILED');
+      throw withRollbackResult(
+        new ActionError(`Could not signal original PID ${current.pid}: ${message}`, 'STOP_FAILED'),
+        'STOP_FAILED',
+        rolledBack,
+      );
     }
     let stopped: boolean;
     try {
       stopped = await waitForListenerGone(current, this.collect, 4_000);
     } catch (error) {
-      await rollbackLaunchedProcess(child.pid, started, this.collect);
-      throw error;
+      const rolledBack = await rollbackLaunchedProcess(child.pid, started, this.collect);
+      throw withRollbackResult(error, 'STOP_FAILED', rolledBack);
     }
     if (!stopped) {
-      await rollbackLaunchedProcess(child.pid, started, this.collect);
-      throw new ActionError(`New port ${nextPort} started, but the original PID ${current.pid} did not stop. Rolled back the new process.`, 'STOP_FAILED');
+      const rolledBack = await rollbackLaunchedProcess(child.pid, started, this.collect);
+      throw new ActionError(
+        `New port ${nextPort} started, but the original PID ${current.pid} did not stop. ${rollbackStatus(rolledBack)}`,
+        'STOP_FAILED',
+      );
     }
 
-    this.updateConfigAfterMove(current, started);
+    let configWarning = '';
+    try {
+      this.updateConfigAfterMove(current, started);
+    } catch (error) {
+      const message = sanitizeText(error instanceof Error ? error.message : String(error));
+      configWarning = `Saved pins/order were not updated: ${message}.`;
+    }
     return {
       message: `Moved ${current.displayProject || current.command}: ${current.port} → ${nextPort}.`,
+      warning: configWarning || undefined,
       listener: started,
       port: nextPort,
       pid: started.pid,
@@ -261,14 +300,21 @@ export class PortwardenActions {
         timeoutMs: 12_000,
       });
     } catch (error) {
-      await rollbackLaunchedProcess(child.pid, undefined, this.collect);
-      throw error;
+      const rolledBack = await rollbackLaunchedProcess(child.pid, undefined, this.collect);
+      throw withRollbackResult(error, 'START_FAILED', rolledBack);
     }
 
-    const config = this.configRepository.get();
-    this.configRepository.update({graveyard: config.graveyard.filter(({id}) => id !== record.id)});
+    let configWarning = '';
+    try {
+      const config = this.configRepository.get();
+      this.configRepository.update({graveyard: config.graveyard.filter(({id}) => id !== record.id)});
+    } catch (error) {
+      const message = sanitizeText(error instanceof Error ? error.message : String(error));
+      configWarning = `Graveyard record was not removed: ${message}.`;
+    }
     return {
       message: `Revived ${record.project} on port ${record.port}.`,
+      warning: configWarning || undefined,
       listener: started,
       port: record.port,
       pid: started.pid,
@@ -288,6 +334,27 @@ export class PortwardenActions {
 
   private async requireCurrentListener(expected: ListenerEntry): Promise<ListenerEntry> {
     return (await this.requireCurrentListenerSnapshot(expected)).current;
+  }
+
+  private async requireMovableListener(expected: ListenerEntry): Promise<ListenerEntry> {
+    const {current, listeners} = await this.requireCurrentListenerSnapshot(expected);
+    this.assertMovableListener(current, listeners);
+    return current;
+  }
+
+  private assertMovableListener(current: ListenerEntry, listeners: readonly ListenerEntry[]): void {
+    const config = this.configRepository.get();
+    const pinnedSibling = listeners.find((listener) =>
+      listener.pid === current.pid &&
+      selectionKey(listener) !== selectionKey(current) &&
+      isPinned(listener, config),
+    );
+    if (pinnedSibling) {
+      throw new ActionError(
+        `PID ${current.pid} also owns pinned port ${pinnedSibling.port}. Unpin it before moving this process.`,
+        'PINNED',
+      );
+    }
   }
 
   private async requireCurrentListenerSnapshot(expected: ListenerEntry): Promise<{
@@ -466,27 +533,101 @@ async function rollbackLaunchedProcess(
   pid: number | undefined,
   started: ListenerEntry | undefined,
   collect: typeof collectListeners,
-): Promise<void> {
-  if (started && started.pid !== pid) {
-    try {
-      const current = (await collect({strict: true})).find((entry) => sameListenerIdentity(entry, started));
-      if (current) process.kill(current.pid, 'SIGTERM');
-    } catch {
-      // Uncertainty during rollback must not prevent terminating the known process group.
-    }
+): Promise<boolean> {
+  await signalVerifiedRollbackTarget(started, collect, 'SIGTERM');
+  terminateLaunchedProcessGroup(pid, 'SIGTERM');
+  if (!started) {
+    if (!pid) return false;
+    if (await waitForLaunchedProcessGroupGone(pid, 750)) return true;
+    terminateLaunchedProcessGroup(pid, 'SIGKILL');
+    return waitForLaunchedProcessGroupGone(pid, 750);
   }
-  terminateLaunchedProcessGroup(pid);
+  if (await waitForSpecificListenerGone(started, collect, 750)) return true;
+
+  await signalVerifiedRollbackTarget(started, collect, 'SIGKILL');
+  terminateLaunchedProcessGroup(pid, 'SIGKILL');
+  return waitForSpecificListenerGone(started, collect, 750);
 }
 
-function terminateLaunchedProcessGroup(pid: number | undefined): void {
+async function signalVerifiedRollbackTarget(
+  started: ListenerEntry | undefined,
+  collect: typeof collectListeners,
+  signal: StopSignal,
+): Promise<void> {
+  if (!started) return;
+  try {
+    const current = (await collect({strict: true})).find((entry) => sameListenerIdentity(entry, started));
+    if (current) process.kill(current.pid, signal);
+  } catch {
+    // A failed revalidation must not prevent signalling the process group launched by Portwarden.
+  }
+}
+
+async function waitForSpecificListenerGone(
+  started: ListenerEntry,
+  collect: typeof collectListeners,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const listeners = await collect({strict: true});
+      if (!listeners.some((entry) => sameListenerIdentity(entry, started))) return true;
+    } catch {
+      return false;
+    }
+    await delay(100);
+  }
+  return false;
+}
+
+async function waitForLaunchedProcessGroupGone(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!launchedProcessGroupExists(pid)) return true;
+    await delay(100);
+  }
+  return false;
+}
+
+function launchedProcessGroupExists(pid: number): boolean {
+  try {
+    process.kill(process.platform === 'win32' ? pid : -pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function withRollbackResult(
+  error: unknown,
+  fallbackCode: ActionError['code'],
+  rolledBack: boolean,
+): ActionError {
+  const code = error instanceof ActionError ? error.code : fallbackCode;
+  const rawMessage = sanitizeText(error instanceof Error ? error.message : String(error));
+  const message = rawMessage.replace(/[.\s]+$/g, '');
+  return new ActionError(
+    `${message}. ${rollbackStatus(rolledBack)}`,
+    code,
+  );
+}
+
+function rollbackStatus(rolledBack: boolean): string {
+  return rolledBack
+    ? 'The new listener was stopped and rollback was verified.'
+    : 'Rollback was requested for the new process; refresh to verify it exited.';
+}
+
+function terminateLaunchedProcessGroup(pid: number | undefined, signal: StopSignal): void {
   if (!pid) {
     return;
   }
   try {
     if (process.platform === 'win32') {
-      process.kill(pid, 'SIGTERM');
+      process.kill(pid, signal);
     } else {
-      process.kill(-pid, 'SIGTERM');
+      process.kill(-pid, signal);
     }
   } catch {
     // The process may already have failed or exited.
@@ -496,6 +637,7 @@ function terminateLaunchedProcessGroup(pid: number | undefined): void {
 function sameListenerIdentity(current: ListenerEntry, expected: ListenerEntry): boolean {
   return current.pid === expected.pid &&
     current.port === expected.port &&
+    canonicalHost(current.host) === canonicalHost(expected.host) &&
     current.startTime?.getTime() === expected.startTime?.getTime() &&
     current.executable === expected.executable &&
     current.uid === expected.uid &&

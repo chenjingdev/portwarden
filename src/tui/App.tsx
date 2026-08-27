@@ -3,6 +3,7 @@ import {useEffect, useMemo, useRef, useState} from 'react';
 import {Box, Text, useApp, useInput, useStdout} from 'ink';
 
 import {openInBrowser} from '../browser.js';
+import {buildBrowserOptions, detectInstalledBrowsers, type BrowserOption} from '../browserCandidates.js';
 import type {ConfigRepository, GraveyardRecord, PortwardenConfig} from '../config.js';
 import {formatCommandForDisplay, redactCommandLine, sanitizeText} from '../core/commands.js';
 import {PortwardenActions, type ActionOutcome, type StopSignal} from '../core/actions.js';
@@ -25,17 +26,9 @@ export interface PortwardenAppProps {
   initialAll?: boolean;
   initialZombies?: boolean;
   browserOverride?: string;
+  actionsOverride?: PortwardenActions;
 }
 
-const BROWSERS = [
-  {label: 'System default', value: ''},
-  {label: 'Google Chrome', value: 'Google Chrome'},
-  {label: 'Safari', value: 'Safari'},
-  {label: 'Firefox', value: 'Firefox'},
-  {label: 'Arc', value: 'Arc'},
-  {label: 'Brave Browser', value: 'Brave Browser'},
-  {label: 'Microsoft Edge', value: 'Microsoft Edge'},
-];
 const REFRESH_INTERVALS = [1, 2, 5, 10];
 
 export function PortwardenApp({
@@ -43,8 +36,10 @@ export function PortwardenApp({
   initialAll = false,
   initialZombies = false,
   browserOverride = '',
+  actionsOverride,
 }: PortwardenAppProps) {
   const {exit} = useApp();
+  const {write: writeStdout} = useStdout();
   const {columns, rows: terminalRows} = useTerminalSize();
   const [config, setConfig] = useState(() => configRepository.get());
   const [all, setAll] = useState(initialAll);
@@ -52,6 +47,7 @@ export function PortwardenApp({
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const [screen, setScreen] = useState<Screen>('main');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [scrollOffset, setScrollOffset] = useState(0);
   const [settingsIndex, setSettingsIndex] = useState(0);
   const [browserIndex, setBrowserIndex] = useState(0);
   const [graveyardIndex, setGraveyardIndex] = useState(0);
@@ -60,10 +56,25 @@ export function PortwardenApp({
   const [filterMode, setFilterMode] = useState(false);
   const [status, setStatus] = useState('');
   const [actionError, setActionError] = useState('');
+  const [actionWarning, setActionWarning] = useState('');
   const [busy, setBusy] = useState('');
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const selectionIndexHint = useRef(0);
-  const actions = useMemo(() => new PortwardenActions(configRepository), [configRepository]);
+  const pendingSelectionKey = useRef<string | null>(null);
+  const actions = useMemo(
+    () => actionsOverride ?? new PortwardenActions(configRepository),
+    [actionsOverride, configRepository],
+  );
+  const normalizedBrowserOverride = useMemo(() => sanitizeText(browserOverride), [browserOverride]);
+  const installedBrowsers = useMemo(() => detectInstalledBrowsers(), []);
+  const browserChoices = useMemo(
+    () => buildBrowserOptions({
+      installedBrowsers,
+      currentBrowser: config.browser,
+      activeBrowser: normalizedBrowserOverride || config.browser,
+    }),
+    [config.browser, installedBrowsers, normalizedBrowserOverride],
+  );
   const scanner = useScanner({all, showZombies, config});
   const visibleRows = useMemo(
     () => buildVisibleRows(scanner.listeners, scanner.zombies, {
@@ -81,6 +92,8 @@ export function PortwardenApp({
       ? selectedIndex
       : clamp(selectionIndexHint.current, 0, visibleRows.length - 1);
   const selectedRow = effectiveSelectedIndex >= 0 ? visibleRows[effectiveSelectedIndex] ?? null : null;
+  const filterLineCount = filterMode || query ? 1 : 0;
+  const mainPageSize = Math.max(1, terminalRows - 15 - filterLineCount);
 
   useEffect(() => {
     if (selectedIndex >= 0) {
@@ -89,7 +102,11 @@ export function PortwardenApp({
   }, [selectedIndex]);
 
   useEffect(() => {
-    if (visibleRows.length === 0) {
+    const pending = pendingSelectionKey.current;
+    if (pending && visibleRows.some(({key}) => key === pending)) {
+      pendingSelectionKey.current = null;
+      setSelectedKey(pending);
+    } else if (visibleRows.length === 0) {
       setSelectedKey(null);
     } else if (!selectedKey || !visibleRows.some(({key}) => key === selectedKey)) {
       setSelectedKey(visibleRows[Math.min(Math.max(effectiveSelectedIndex, 0), visibleRows.length - 1)]?.key ?? null);
@@ -100,14 +117,29 @@ export function PortwardenApp({
     setGraveyardIndex((current) => clamp(current, 0, Math.max(0, config.graveyard.length - 1)));
   }, [config.graveyard.length]);
 
+  useEffect(() => {
+    setScrollOffset((current) => {
+      const maximum = Math.max(0, visibleRows.length - mainPageSize);
+      const bounded = clamp(current, 0, maximum);
+      if (effectiveSelectedIndex < 0) return 0;
+      if (effectiveSelectedIndex < bounded) return effectiveSelectedIndex;
+      if (effectiveSelectedIndex >= bounded + mainPageSize) {
+        return clamp(effectiveSelectedIndex - mainPageSize + 1, 0, maximum);
+      }
+      return bounded;
+    });
+  }, [effectiveSelectedIndex, mainPageSize, visibleRows.length]);
+
   const refreshConfig = () => setConfig(configRepository.get());
   const saveConfig = (patch: Partial<PortwardenConfig>, message = '') => {
     try {
       const saved = configRepository.update(patch);
       setConfig(saved);
       setActionError('');
+      setActionWarning('');
       if (message) setStatus(message);
     } catch (error) {
+      setActionWarning('');
       setActionError(errorMessage(error));
     }
   };
@@ -115,19 +147,47 @@ export function PortwardenApp({
   const runAction = async (label: string, action: () => Promise<ActionOutcome | string>) => {
     setBusy(label);
     setActionError('');
+    setActionWarning('');
     try {
       const result = await action();
       setStatus(typeof result === 'string' ? result : result.message);
-      refreshConfig();
-      scanner.refresh();
+      let warning = typeof result === 'string' ? '' : result.warning ?? '';
+      if (typeof result !== 'string' && result.listener) {
+        pendingSelectionKey.current = `listener:${selectionKey(result.listener)}`;
+      }
+      try {
+        refreshConfig();
+      } catch (error) {
+        warning ||= `Config could not be reloaded: ${errorMessage(error)}`;
+      }
+      try {
+        scanner.refresh();
+      } catch (error) {
+        warning ||= `Port list could not be refreshed: ${errorMessage(error)}`;
+      }
+      setActionWarning(warning);
     } catch (error) {
+      pendingSelectionKey.current = null;
+      setActionWarning('');
       setActionError(errorMessage(error));
+      try {
+        refreshConfig();
+      } catch {
+        // Keep the original action error visible.
+      }
+      try {
+        scanner.refresh();
+      } catch {
+        // The original action error still explains why manual verification is needed.
+      }
     } finally {
       setBusy('');
     }
   };
 
   const queueAction = (title: string, detail: string, action: () => Promise<void>) => {
+    setActionError('');
+    setActionWarning('');
     if (config.confirmActions) {
       setConfirmation({title, detail, action});
     } else {
@@ -137,12 +197,14 @@ export function PortwardenApp({
 
   const moveMainSelection = (delta: number) => {
     if (visibleRows.length === 0) return;
+    pendingSelectionKey.current = null;
     const next = clamp(effectiveSelectedIndex + delta, 0, visibleRows.length - 1);
     selectionIndexHint.current = next;
     setSelectedKey(visibleRows[next]?.key ?? null);
   };
 
   const toggleSelectedPin = () => {
+    pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
       setActionError(selectedRow?.type === 'group' ? 'Expand the app group and select one listener to pin it.' : 'Only LISTEN ports can be pinned.');
       return;
@@ -176,36 +238,45 @@ export function PortwardenApp({
   };
 
   const reorderSelected = (direction: -1 | 1) => {
+    pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
       if (selectedRow?.type === 'group') toggleGroup(selectedRow, direction > 0);
       return;
     }
     const selectedPinned = listenerIsPinned(selectedRow.listener, config.pinnedListenerKeys);
-    const section = scanner.listeners.filter((listener) => listenerIsPinned(listener, config.pinnedListenerKeys) === selectedPinned);
-    const index = section.findIndex((listener) => selectionKey(listener) === selectionKey(selectedRow.listener));
-    const target = index + direction;
-    if (index < 0 || target < 0 || target >= section.length) {
+    const section = visibleRows.filter((row): row is Extract<VisibleRow, {type: 'listener'}> =>
+      row.type === 'listener' &&
+      row.parentGroupKey === selectedRow.parentGroupKey &&
+      listenerIsPinned(row.listener, config.pinnedListenerKeys) === selectedPinned,
+    );
+    const visibleIndex = section.findIndex(({listener}) => selectionKey(listener) === selectionKey(selectedRow.listener));
+    const targetRow = section[visibleIndex + direction];
+    if (visibleIndex < 0 || !targetRow) {
       setStatus('Already at the edge of this section.');
       return;
     }
-    const reordered = [...section];
-    [reordered[index], reordered[target]] = [reordered[target]!, reordered[index]!];
+    const reordered = [...scanner.listeners];
+    const sourceIndex = reordered.findIndex((listener) => selectionKey(listener) === selectionKey(selectedRow.listener));
+    const targetIndex = reordered.findIndex((listener) => selectionKey(listener) === selectionKey(targetRow.listener));
+    if (sourceIndex < 0 || targetIndex < 0) {
+      setActionError('The selected listener changed. Refresh and try again.');
+      return;
+    }
+    [reordered[sourceIndex], reordered[targetIndex]] = [reordered[targetIndex]!, reordered[sourceIndex]!];
     const presentKeys = new Set(scanner.listeners.flatMap((listener) => [
       ...listenerKeys(listener),
       preferenceKey(listener),
       selectionKey(listener),
     ]));
-    const otherVisible = scanner.listeners
-      .filter((listener) => listenerIsPinned(listener, config.pinnedListenerKeys) !== selectedPinned)
-      .map(listenerKey);
     const staleSaved = config.orderedEntryKeys.filter((key) => !presentKeys.has(key));
     saveConfig(
-      {orderedEntryKeys: [...reordered.map(listenerKey), ...otherVisible, ...staleSaved]},
+      {orderedEntryKeys: [...reordered.map(listenerKey), ...staleSaved]},
       `Moved ${selectedRow.listener.displayProject || selectedRow.listener.command} ${direction < 0 ? 'up' : 'down'}.`,
     );
   };
 
   const toggleGroup = (row: Extract<VisibleRow, {type: 'group'}>, force?: boolean) => {
+    pendingSelectionKey.current = null;
     setExpandedGroups((current) => {
       const next = new Set(current);
       const expand = force ?? !next.has(row.key);
@@ -215,14 +286,47 @@ export function PortwardenApp({
     });
   };
 
+  const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener'}>): boolean => {
+    if (!row.parentGroupKey) return false;
+    const parent = visibleRows.find((candidate): candidate is Extract<VisibleRow, {type: 'group'}> =>
+      candidate.type === 'group' && candidate.key === row.parentGroupKey,
+    );
+    if (!parent) return false;
+    setSelectedKey(parent.key);
+    selectionIndexHint.current = visibleRows.findIndex(({key}) => key === parent.key);
+    toggleGroup(parent, false);
+    setStatus(`Collapsed app group: ${parent.family}.`);
+    return true;
+  };
+
   const stopSelected = (signal: StopSignal) => {
     if (!selectedRow || selectedRow.type === 'group') {
       setActionError(selectedRow ? 'Expand the group and select one process first.' : 'No process selected.');
       return;
     }
+    if (selectedRow.type === 'listener') {
+      const pinnedForPid = scanner.allListeners.find((listener) =>
+        listener.pid === selectedRow.listener.pid && listenerIsPinned(listener, config.pinnedListenerKeys),
+      );
+      if (pinnedForPid) {
+        setActionError(selectionKey(pinnedForPid) === selectionKey(selectedRow.listener)
+          ? `Port ${selectedRow.listener.port} is pinned. Unpin it before stopping.`
+          : `PID ${selectedRow.listener.pid} also owns pinned port ${pinnedForPid.port}. Unpin every listener for that PID before stopping it.`);
+        return;
+      }
+    }
+    const siblingPorts = selectedRow.type === 'listener'
+      ? scanner.allListeners
+        .filter((listener) =>
+          listener.pid === selectedRow.listener.pid && selectionKey(listener) !== selectionKey(selectedRow.listener),
+        )
+        .map((listener) => `${listener.displayHost || listener.host}:${listener.port}`)
+      : [];
     const target = selectedRow.type === 'listener'
-      ? `${selectedRow.listener.displayProject || selectedRow.listener.command}:${selectedRow.listener.port}`
-      : `${selectedRow.zombie.family} PID ${selectedRow.zombie.pid}`;
+      ? siblingPorts.length > 0
+        ? `port ${selectedRow.listener.port} (PID ${selectedRow.listener.pid}; also stops ${siblingPorts.join(', ')})`
+        : `port ${selectedRow.listener.port} (PID ${selectedRow.listener.pid}, ${selectedRow.listener.displayProject || selectedRow.listener.command})`
+      : `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})`;
     queueAction(
       signal === 'SIGKILL' ? `Force-stop ${target}?` : `Stop ${target}?`,
       signal === 'SIGKILL' ? 'SIGKILL does not allow cleanup.' : 'SIGTERM lets the process clean up first.',
@@ -240,9 +344,25 @@ export function PortwardenApp({
       return;
     }
     const listener = selectedRow.listener;
+    const siblings = scanner.allListeners.filter((candidate) =>
+      candidate.pid === listener.pid && selectionKey(candidate) !== selectionKey(listener),
+    );
+    const pinnedSibling = siblings.find((candidate) => listenerIsPinned(candidate, config.pinnedListenerKeys));
+    if (pinnedSibling) {
+      setActionError(`PID ${listener.pid} also owns pinned port ${pinnedSibling.port}. Unpin it before moving this process.`);
+      return;
+    }
+    const nextPort = nextAvailablePort(scanner.allListeners, listener.port);
+    if (nextPort === '-') {
+      setActionError(`No higher port is available after ${listener.port}.`);
+      return;
+    }
+    const moveTitle = siblings.length > 0
+      ? `Move port ${listener.port} to the next available port; restarting PID ${listener.pid} also stops ${siblings.map((candidate) => `${candidate.displayHost || candidate.host}:${candidate.port}`).join(', ')}?`
+      : `Move port ${listener.port} (PID ${listener.pid}) to the next available port?`;
     queueAction(
-      `Move ${listener.displayProject || listener.command}:${listener.port}?`,
-      'Portwarden starts and verifies the new listener before stopping the original.',
+      moveTitle,
+      `Project ${listener.displayProject || listener.command}. Current candidate: ${nextPort}; Portwarden rechecks before launch, so the target can change.`,
       async () => runAction('Moving port…', () => actions.moveListener(listener)),
     );
   };
@@ -256,7 +376,7 @@ export function PortwardenApp({
     void runAction('Opening browser…', async () => {
       const url = await openInBrowser(
         {host: listener.host, port: listener.port, commandLine: listener.args},
-        browserOverride || config.browser,
+        normalizedBrowserOverride || config.browser,
       );
       return `Opened ${url}.`;
     });
@@ -266,7 +386,7 @@ export function PortwardenApp({
     const record = config.graveyard[graveyardIndex];
     if (!record) return;
     queueAction(
-      `Revive ${record.project}:${record.port}?`,
+      `Revive port ${record.port} (${record.project})?`,
       'The record stays in the graveyard until the expected listener is verified.',
       async () => runAction('Reviving…', () => actions.revive(record)),
     );
@@ -276,15 +396,23 @@ export function PortwardenApp({
     const record = config.graveyard[graveyardIndex];
     if (!record) return;
     queueAction(
-      `Discard ${record.project}:${record.port}?`,
+      `Discard port ${record.port} (${record.project})?`,
       'This removes only the saved relaunch record.',
       async () => runAction('Discarding…', async () => actions.discard(record)),
     );
   };
 
   useInput((input, key) => {
-    if (busy) return;
     const normalized = normalizeShortcut(input, key);
+    if (key.ctrl && normalized === 'c') {
+      if (!busy) exit();
+      return;
+    }
+    if (key.ctrl && normalized === 'l') {
+      writeStdout('\u001B[2J\u001B[3J\u001B[H');
+      return;
+    }
+    if (busy) return;
 
     if (confirmation) {
       if (key.return || normalized === 'y') {
@@ -299,10 +427,12 @@ export function PortwardenApp({
 
     if (filterMode) {
       if (key.return) {
+        pendingSelectionKey.current = null;
         setQuery(filterDraft.trim());
         setFilterMode(false);
         setStatus(filterDraft.trim() ? `Filter: ${filterDraft.trim()}` : 'Filter cleared.');
       } else if (key.escape) {
+        pendingSelectionKey.current = null;
         setFilterDraft(query);
         setFilterMode(false);
       } else if (key.backspace || key.delete) {
@@ -319,10 +449,10 @@ export function PortwardenApp({
     }
 
     if (screen === 'browser') {
-      if (key.upArrow) setBrowserIndex((value) => clamp(value - 1, 0, browserOptions(config.browser).length - 1));
-      else if (key.downArrow) setBrowserIndex((value) => clamp(value + 1, 0, browserOptions(config.browser).length - 1));
+      if (key.upArrow) setBrowserIndex((value) => clamp(value - 1, 0, browserChoices.length - 1));
+      else if (key.downArrow) setBrowserIndex((value) => clamp(value + 1, 0, browserChoices.length - 1));
       else if (key.return) {
-        const option = browserOptions(config.browser)[browserIndex];
+        const option = browserChoices[browserIndex];
         if (option) saveConfig({browser: option.value}, `Browser: ${option.label}.`);
         setScreen('settings');
       } else if (key.escape || normalized === 'q' || normalized === 's') setScreen('settings');
@@ -334,8 +464,7 @@ export function PortwardenApp({
       else if (key.downArrow) setSettingsIndex((value) => clamp(value + 1, 0, 2));
       else if (key.return || key.rightArrow) {
         if (settingsIndex === 0) {
-          const options = browserOptions(config.browser);
-          setBrowserIndex(Math.max(0, options.findIndex(({value}) => value === config.browser)));
+          setBrowserIndex(Math.max(0, browserChoices.findIndex(({value}) => value === config.browser)));
           setScreen('browser');
         } else if (settingsIndex === 1) {
           saveConfig({confirmActions: !config.confirmActions}, `Confirm mode ${config.confirmActions ? 'off' : 'on'}.`);
@@ -357,26 +486,28 @@ export function PortwardenApp({
       return;
     }
 
-    if (key.ctrl && normalized === 'c') {
-      exit();
-    } else if (key.upArrow) {
+    if (key.upArrow) {
       moveMainSelection(-1);
     } else if (key.downArrow) {
       moveMainSelection(1);
     } else if (key.leftArrow) {
       if (selectedRow?.type === 'group') toggleGroup(selectedRow, false);
-      else reorderSelected(-1);
+      else if (selectedRow?.type !== 'listener' || !collapseParentGroup(selectedRow)) reorderSelected(-1);
     } else if (key.rightArrow) {
       if (selectedRow?.type === 'group') toggleGroup(selectedRow, true);
       else reorderSelected(1);
     } else if (key.return && selectedRow?.type === 'group') {
       toggleGroup(selectedRow);
+    } else if (key.return && selectedRow?.type === 'listener' && selectedRow.parentGroupKey) {
+      collapseParentGroup(selectedRow);
     } else if (normalized === 'q') {
       exit();
     } else if (normalized === 'a') {
+      pendingSelectionKey.current = null;
       setAll((value) => !value);
       setStatus(all ? 'Showing pinned + dev ports.' : 'Showing all LISTEN ports.');
     } else if (normalized === 'z') {
+      pendingSelectionKey.current = null;
       setShowZombies((value) => !value);
       setStatus(showZombies ? 'Zombies hidden.' : 'Zombies visible.');
     } else if (normalized === 'p') {
@@ -390,29 +521,56 @@ export function PortwardenApp({
     } else if (normalized === 'f') {
       stopSelected('SIGKILL');
     } else if (normalized === 'g') {
+      pendingSelectionKey.current = null;
       refreshConfig();
       setScreen('graveyard');
     } else if (normalized === 's') {
+      pendingSelectionKey.current = null;
       setScreen('settings');
     } else if (normalized === 'r') {
+      pendingSelectionKey.current = null;
+      setActionError('');
+      setActionWarning('');
       scanner.refresh();
       setStatus('Refreshing…');
     } else if (normalized === '?') {
       setScreen('help');
     } else if (normalized === '/') {
+      pendingSelectionKey.current = null;
       setFilterDraft(query);
       setFilterMode(true);
     } else if (key.escape && query) {
+      pendingSelectionKey.current = null;
       setQuery('');
       setStatus('Filter cleared.');
     }
   });
 
   if (screen === 'settings') {
-    return <SettingsScreen config={config} selectedIndex={settingsIndex} status={status} error={actionError} />;
+    return (
+      <SettingsScreen
+        config={config}
+        selectedIndex={settingsIndex}
+        status={status}
+        error={actionError}
+        configPath={configRepository.path}
+        browserOverride={normalizedBrowserOverride}
+        columns={columns}
+        terminalRows={terminalRows}
+      />
+    );
   }
   if (screen === 'browser') {
-    return <BrowserScreen options={browserOptions(config.browser)} selectedIndex={browserIndex} />;
+    return (
+      <BrowserScreen
+        options={browserChoices}
+        selectedIndex={browserIndex}
+        savedBrowser={config.browser}
+        activeBrowser={normalizedBrowserOverride || config.browser}
+        columns={columns}
+        terminalRows={terminalRows}
+      />
+    );
   }
   if (screen === 'graveyard') {
     return (
@@ -423,8 +581,10 @@ export function PortwardenApp({
         status={status}
         error={actionError || scanner.error}
         busy={busy}
+        warning={actionWarning}
         columns={columns}
         terminalRows={terminalRows}
+        confirmation={confirmation}
       />
     );
   }
@@ -437,34 +597,38 @@ export function PortwardenApp({
       <MainHeader
         all={all}
         showZombies={showZombies}
-        listenerCount={scanner.listeners.length}
+        listenerCount={all ? scanner.allListeners.length : scanner.listeners.length}
+        rowCount={visibleRows.length}
+        hiddenCount={all ? 0 : Math.max(0, scanner.allListeners.length - scanner.listeners.length)}
         zombieCount={scanner.zombies.length}
+        selectedIndex={effectiveSelectedIndex}
+        browser={normalizedBrowserOverride || config.browser}
         loading={scanner.loading}
         refreshing={scanner.refreshing}
         updatedAt={scanner.updatedAt}
         error={scanner.error}
       />
       {filterMode ? (
-        <Text color="yellow">filter / {filterDraft}<Text inverse> </Text></Text>
+        <Text color="yellow" wrap="truncate-end">filter / {filterDraft}<Text inverse> </Text></Text>
       ) : query ? (
-        <Text color="yellow">filter: {query}  <Text dimColor>(esc clear)</Text></Text>
+        <Text color="yellow" wrap="truncate-end">filter: {query}  <Text dimColor>(esc clear)</Text></Text>
       ) : null}
       <MainTable
         rows={visibleRows}
         selectedIndex={effectiveSelectedIndex}
         config={config}
         columns={columns}
-        terminalRows={terminalRows}
+        pageSize={mainPageSize}
+        offset={scrollOffset}
+        all={all}
       />
-      <Details row={selectedRow} config={config} columns={columns} />
+      <Details row={selectedRow} config={config} columns={columns} listeners={scanner.allListeners} />
+      <ShortcutLine row={selectedRow} columns={columns} />
       {confirmation ? (
         <ConfirmationBox confirmation={confirmation} />
       ) : (
-        <StatusLine busy={busy} status={status} error={actionError || scanner.error} />
+        <StatusLine busy={busy} status={status} error={actionError || scanner.error} warning={actionWarning} />
       )}
-      <Text dimColor>
-        ↑↓ select  ←→ reorder  a all  z zombies  p pin  o open  m move  x stop  f force-stop  g graveyard  s settings  / filter  ? help  q quit
-      </Text>
     </Box>
   );
 }
@@ -473,21 +637,29 @@ function MainHeader(props: {
   all: boolean;
   showZombies: boolean;
   listenerCount: number;
+  rowCount: number;
+  hiddenCount: number;
   zombieCount: number;
+  selectedIndex: number;
+  browser: string;
   loading: boolean;
   refreshing: boolean;
   updatedAt: Date | null;
   error: string;
 }) {
-  const activity = props.loading ? 'scanning…' : props.refreshing ? 'refreshing…' : props.error ? 'degraded' : 'ready';
+  const activity = props.loading ? 'scanning' : props.refreshing ? 'refreshing' : props.error ? 'degraded' : '';
   return (
-    <Box justifyContent="space-between">
-      <Text bold color="cyan">
-        PORTWARDEN  <Text color="white">[{props.all ? 'ALL' : 'DEV'}]</Text> <Text color="green">[{props.listenerCount} ports]</Text>{' '}
+    <Box flexDirection="column">
+      <Text bold color="cyan" wrap="truncate-end">
+        PORTWARDEN  <Text color={props.all ? 'cyan' : 'green'}>[{props.all ? 'ALL' : 'MAIN'}]</Text>{' '}
+        <Text color="white">[{props.listenerCount} port{props.listenerCount === 1 ? '' : 's'}]</Text>{' '}
+        {props.all && props.rowCount !== props.listenerCount ? <Text color="gray">[{props.rowCount} rows] </Text> : null}
+        {!props.all && props.hiddenCount > 0 ? <Text color="yellow">[hidden {props.hiddenCount}] </Text> : null}
         {props.showZombies ? <Text color={props.zombieCount ? 'red' : 'gray'}>[{props.zombieCount} zombies]</Text> : null}
       </Text>
-      <Text color={props.error ? 'red' : props.refreshing || props.loading ? 'yellow' : 'gray'}>
-        {activity}{props.updatedAt ? ` · ${formatClock(props.updatedAt)}` : ''}
+      <Text dimColor wrap="truncate-end">
+        refresh {props.updatedAt ? formatClock(props.updatedAt) : '--:--:--'}  browser {sanitizeText(props.browser) || 'system'}  selected{' '}
+        {props.selectedIndex >= 0 ? props.selectedIndex + 1 : 0}/{props.rowCount}{activity ? `  ${activity}` : ''}
       </Text>
     </Box>
   );
@@ -498,19 +670,25 @@ function MainTable(props: {
   selectedIndex: number;
   config: PortwardenConfig;
   columns: number;
-  terminalRows: number;
+  pageSize: number;
+  offset: number;
+  all: boolean;
 }) {
-  const pageSize = Math.max(3, props.terminalRows - 12);
-  const offset = props.selectedIndex < 0
-    ? 0
-    : clamp(props.selectedIndex - Math.floor(pageSize / 2), 0, Math.max(0, props.rows.length - pageSize));
-  const visible = props.rows.slice(offset, offset + pageSize);
-  const widths = tableWidths(props.columns);
+  const offset = clamp(props.offset, 0, Math.max(0, props.rows.length - props.pageSize));
+  const visible = props.rows.slice(offset, offset + props.pageSize);
+  const showKind = props.all || props.rows.some((row) => row.type !== 'listener' || row.listener.kind !== 'dev');
+  const widths = tableWidths(props.columns, showKind);
+  const showing = props.rows.length === 0
+    ? 'empty'
+    : `showing ${offset + 1}-${Math.min(offset + visible.length, props.rows.length)} of ${props.rows.length}`;
+  const fillerCount = Math.max(0, props.pageSize - Math.max(1, visible.length));
   return (
     <Box flexDirection="column" marginTop={1}>
-      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'PROCESS']} widths={widths} header />
+      <Text><Text bold>PORTS</Text>  <Text dimColor>{showing}</Text></Text>
+      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
+      <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
       {visible.length === 0 ? (
-        <Text dimColor>No matching LISTEN ports or zombies.</Text>
+        <Text color="yellow">  {props.all ? 'No LISTEN ports found.' : 'No pinned or dev ports found.'}</Text>
       ) : visible.map((row, localIndex) => (
         <DataRow
           key={row.key}
@@ -518,38 +696,48 @@ function MainTable(props: {
           selected={offset + localIndex === props.selectedIndex}
           widths={widths}
           config={props.config}
+          columns={props.columns}
         />
       ))}
-      {props.rows.length > pageSize ? (
-        <Text dimColor>{offset + 1}–{Math.min(offset + pageSize, props.rows.length)} / {props.rows.length}</Text>
-      ) : null}
+      {Array.from({length: fillerCount}, (_, index) => <Text key={`filler:${index}`}> </Text>)}
     </Box>
   );
 }
 
-function DataRow({row, selected, widths, config}: {
+function DataRow({row, selected, widths, config, columns}: {
   row: VisibleRow;
   selected: boolean;
   widths: number[];
   config: PortwardenConfig;
+  columns: number;
 }) {
   if (row.type === 'group') {
     const hosts = [...new Set(row.members.map(({displayHost}) => displayHost))].join(', ');
-    const pinned = row.members.every((listener) => listenerIsPinned(listener, config.pinnedListenerKeys));
     return (
       <TableRow
-        values={['app', pinned ? '●' : '-', `${row.members.length}×`, '-', '-', hosts, row.family, `${row.expanded ? '▾' : '▸'} ${row.members.length} listeners` ]}
+        values={[
+          'APP',
+          '-',
+          `${row.members.length}x`,
+          '-',
+          '-',
+          hosts,
+          `${row.expanded ? 'v ' : '> '}${row.family}`,
+          row.expanded ? `open · ${row.members.length} listeners · enter collapse` : `closed · ${row.members.length} listeners`,
+        ]}
         widths={widths}
+        columns={columns}
         selected={selected}
-        color={pinned ? 'cyan' : 'magenta'}
+        color={row.expanded ? 'cyan' : 'yellow'}
       />
     );
   }
   if (row.type === 'zombie') {
     return (
       <TableRow
-        values={['zombie', '-', '-', String(row.zombie.pid), formatSeconds(row.zombie.ageSeconds), '-', row.zombie.family, redactCommandLine(row.zombie.command)]}
+        values={['ZOMBIE', '-', '-', String(row.zombie.pid), formatSeconds(row.zombie.ageSeconds), '-', row.zombie.family, redactCommandLine(row.zombie.command)]}
         widths={widths}
+        columns={columns}
         selected={selected}
         color="red"
       />
@@ -559,130 +747,207 @@ function DataRow({row, selected, widths, config}: {
   return (
     <TableRow
       values={[
-        row.listener.kind,
-        pinned ? '●' : '-',
+        row.depth ? '' : row.listener.kind.toUpperCase(),
+        pinned ? 'Y' : '-',
         String(row.listener.port),
         String(row.listener.pid),
         row.listener.elapsed,
         row.listener.displayHost,
-        `${row.depth ? '  ↳ ' : ''}${row.listener.displayProject || '-'}`,
-        redactCommandLine(row.listener.args || row.listener.displayCommand),
+        `${row.depth ? '| ' : ''}${row.listener.displayProject || '-'}`,
+        `${row.depth ? '| ' : ''}${redactCommandLine(row.listener.displayCommand || row.listener.args)}`,
       ]}
       widths={widths}
+      columns={columns}
       selected={selected}
-      color={pinned ? 'cyan' : row.listener.kind === 'dev' ? 'green' : undefined}
+      color={undefined}
     />
   );
 }
 
-function TableRow({values, widths, selected = false, header = false, color}: {
+function TableRow({values, widths, columns, selected = false, header = false, color}: {
   values: readonly string[];
   widths: readonly number[];
+  columns: number;
   selected?: boolean;
   header?: boolean;
   color?: string;
 }) {
+  const cells = values.flatMap((value, index) => {
+    const width = widths[index] ?? 0;
+    return width > 0 ? [padDisplayText(sanitizeText(value), width)] : [];
+  });
+  const line = truncateDisplayText(`${selected ? '>' : ' '} ${cells.join(' ')}`, columns);
+  return <Text bold={header} dimColor={header} inverse={selected} color={color}>{line}</Text>;
+}
+
+function Details({row, config, columns, listeners}: {
+  row: VisibleRow | null;
+  config: PortwardenConfig;
+  columns: number;
+  listeners: readonly ListenerEntry[];
+}) {
+  const lines = detailLines(row, config, listeners);
+  const label = row?.type === 'group'
+    ? row.family
+    : row?.type === 'listener'
+      ? row.listener.displayProject || '-'
+      : row?.type === 'zombie'
+        ? row.zombie.family
+        : '';
   return (
-    <Box>
-      {values.map((value, index) => widths[index] && widths[index]! > 0 ? (
-        <Box key={index} width={widths[index]} paddingRight={1}>
-          <Text bold={header} dimColor={header} inverse={selected} color={color} wrap="truncate-end">
-            {sanitizeText(value)}
-          </Text>
-        </Box>
-      ) : null)}
+    <Box flexDirection="column">
+      <Text wrap="truncate-end"><Text bold>DETAILS</Text>{label ? <>  <Text dimColor>{sanitizeText(label)}</Text></> : null}</Text>
+      <Text dimColor>{'-'.repeat(Math.max(1, columns - 1))}</Text>
+      {lines.map((line, index) => (
+        <Text key={index} dimColor={index > 0} wrap="truncate-end">{line || ' '}</Text>
+      ))}
     </Box>
   );
 }
 
-function Details({row, config, columns}: {row: VisibleRow | null; config: PortwardenConfig; columns: number}) {
-  if (!row) {
-    return <Box marginTop={1}><Text dimColor>No selection.</Text></Box>;
-  }
+function detailLines(
+  row: VisibleRow | null,
+  config: PortwardenConfig,
+  listeners: readonly ListenerEntry[],
+): [string, string, string, string, string] {
+  if (!row) return ['No port selected.', '', '', '', ''];
   if (row.type === 'group') {
-    return (
-      <Box flexDirection="column" marginTop={1}>
-        <Text bold>DETAILS  <Text color="magenta">{row.family}</Text> · {row.members.length} listeners · {row.expanded ? 'expanded' : 'collapsed'}</Text>
-        <Text dimColor>enter/←/→ {row.expanded ? 'collapse' : 'expand'} · choose a child listener before pin/open/move/stop</Text>
-      </Box>
-    );
+    const ports = [...new Set(row.members.map(({port}) => port))];
+    const hosts = [...new Set(row.members.map(({displayHost}) => displayHost))].filter(Boolean);
+    const commands = [...new Set(row.members.map(({displayCommand}) => redactCommandLine(displayCommand)).filter(Boolean))];
+    return [
+      `group ${row.family}  kind APP  listeners ${row.members.length}  state ${row.expanded ? 'expanded' : 'collapsed'}`,
+      `ports ${ports.slice(0, 5).join(', ')}${ports.length > 5 ? ` +${ports.length - 5}` : ''}  host ${hosts.join(', ') || '-'}`,
+      `apps ${commands.slice(0, 4).join(' · ') || '-'}`,
+      `hint enter ${row.expanded ? 'collapse' : 'expand'}  choose a listener to open, pin, move, or stop`,
+      `proc ${commands[0] || '-'}`,
+    ];
   }
   if (row.type === 'zombie') {
-    return (
-      <Box flexDirection="column" marginTop={1}>
-        <Text bold>DETAILS  <Text color="red">ZOMBIE</Text> · pid {row.zombie.pid} · ppid {row.zombie.ppid} · age {formatSeconds(row.zombie.ageSeconds)} · reapable {row.zombie.reapable ? 'yes' : 'no'}</Text>
-        <Text wrap="truncate-end">{redactCommandLine(row.zombie.command).slice(0, Math.max(10, columns - 1))}</Text>
-        <Text dimColor>{sanitizeText(row.zombie.reason)} · x stop · f force-stop</Text>
-      </Box>
-    );
+    return [
+      `pid ${row.zombie.pid}  ppid ${row.zombie.ppid}  kind ZOMBIE  age ${formatSeconds(row.zombie.ageSeconds)}  reapable ${row.zombie.reapable ? 'YES' : 'NO'}`,
+      `family ${row.zombie.family}`,
+      `reason ${sanitizeText(row.zombie.reason) || '-'}`,
+      `proc ${redactCommandLine(row.zombie.command)}`,
+      'hint x stop  f force-stop',
+    ];
   }
   const pinned = listenerIsPinned(row.listener, config.pinnedListenerKeys);
-  return (
-    <Box flexDirection="column" marginTop={1}>
-      <Text bold>
-        DETAILS  port <Text color="cyan">{row.listener.port}</Text> · pid {row.listener.pid} · {row.listener.kind} · age {row.listener.elapsed} · pin {pinned ? 'yes' : 'no'}
-      </Text>
-      <Text wrap="truncate-end">cwd {sanitizeText(row.listener.displayCwd || row.listener.cwd) || '-'}</Text>
-      <Text dimColor wrap="truncate-end">cmd {redactCommandLine(row.listener.args || row.listener.displayCommand)}</Text>
-    </Box>
-  );
+  const duplicateCount = listeners.filter(({port}) => port === row.listener.port).length;
+  return [
+    `port ${row.listener.port}  pid ${row.listener.pid}  kind ${row.listener.kind.toUpperCase()}  age ${row.listener.elapsed}  pin ${pinned ? 'YES' : 'NO'}`,
+    `next ${nextAvailablePort(listeners, row.listener.port)}  dup ${duplicateCount > 1 ? `${duplicateCount} in use` : 'none'}  host ${row.listener.displayHost || row.listener.host}`,
+    `proj ${row.listener.displayProject || '-'}`,
+    `dir  ${sanitizeText(row.listener.displayCwd || row.listener.cwd) || '-'}`,
+    `cmd  ${redactCommandLine(row.listener.displayCommand || row.listener.args) || '-'}`,
+  ];
 }
 
-function StatusLine({busy, status, error}: {busy: string; status: string; error: string}) {
-  return (
-    <Box marginTop={1}>
-      {error ? <Text color="red">error  {sanitizeText(error)}</Text>
-        : busy ? <Text color="yellow">working  {busy}</Text>
-          : <Text color="cyan">info  {sanitizeText(status) || 'Ready.'}</Text>}
-    </Box>
-  );
+function StatusLine({busy, status, error, warning = ''}: {busy: string; status: string; error: string; warning?: string}) {
+  if (error) return <Text color="red" wrap="truncate-end">error  {sanitizeText(error)}</Text>;
+  if (busy) return <Text color="yellow" wrap="truncate-end">working  {sanitizeText(busy)}</Text>;
+  if (warning) return <Text color="yellow" wrap="truncate-end">warning  {sanitizeText(warning)}</Text>;
+  return status
+    ? <Text color="green" wrap="truncate-end">info  {sanitizeText(status)}</Text>
+    : <Text dimColor wrap="truncate-end">info  Ready</Text>;
 }
 
 function ConfirmationBox({confirmation}: {confirmation: Confirmation}) {
   return (
-    <Box flexDirection="column" borderStyle="single" borderColor="yellow" paddingX={1} marginTop={1}>
-      <Text bold color="yellow">{confirmation.title}</Text>
-      <Text>{confirmation.detail}</Text>
-      <Text dimColor>enter/y confirm · esc/n cancel</Text>
-    </Box>
+    <Text color="yellow" wrap="truncate-end">
+      confirm  {sanitizeText(confirmation.title)}  enter/y confirm  esc/n cancel  {sanitizeText(confirmation.detail)}
+    </Text>
   );
 }
 
-function SettingsScreen({config, selectedIndex, status, error}: {
+function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number}) {
+  const shortcuts = row?.type === 'group'
+    ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
+    : row?.type === 'listener' && row.parentGroupKey
+      ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
+      : row?.type === 'zombie'
+        ? 'x stop  f force-stop  a all/main  g graveyard  s settings  q quit  z hide-zombies  / filter  r refresh  ? help'
+        : '←/→ reorder  a all/main  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help';
+  return <Text dimColor wrap="truncate-end">{truncateRawText(`keys: ${shortcuts}`, columns)}</Text>;
+}
+
+function SettingsScreen({config, selectedIndex, status, error, configPath, browserOverride, columns, terminalRows}: {
   config: PortwardenConfig;
   selectedIndex: number;
   status: string;
   error: string;
+  configPath: string;
+  browserOverride: string;
+  columns: number;
+  terminalRows: number;
 }) {
   const options = [
-    ['Default browser', config.browser || 'System default'],
-    ['Confirm actions', config.confirmActions ? 'On' : 'Off'],
+    ['Default browser', config.browser || 'System default browser'],
+    ['Confirm mode', config.confirmActions ? 'On' : 'Off'],
     ['Refresh interval', `${config.refreshSeconds}s`],
   ];
+  const fillerCount = Math.max(0, terminalRows - 12 - options.length);
   return (
-    <Box flexDirection="column">
-      <Text bold color="cyan">PORTWARDEN  [SETTINGS]</Text>
-      <Text dimColor>enter change · ↑↓ select · esc/s/q back</Text>
+    <Box flexDirection="column" width={columns}>
+      <Text bold color="cyan">SETTINGS</Text>
+      <Text dimColor wrap="truncate-end">saved {sanitizeText(config.browser) || 'System default browser'}  confirm {config.confirmActions ? 'On' : 'Off'}  refresh {config.refreshSeconds}s</Text>
+      <Text wrap="truncate-end">{browserOverride ? <Text color="yellow">This session uses browser override: {sanitizeText(browserOverride)}</Text> : ' '}</Text>
+      <Text wrap="truncate-end">browser {sanitizeText(config.browser) || 'System default browser'}</Text>
+      <Text>safety  {config.confirmActions ? 'Confirm destructive actions' : 'Immediate actions'}</Text>
+      <Text>refresh {config.refreshSeconds}s</Text>
       <Box flexDirection="column" marginTop={1}>
+        <Text bold>PREFERENCES</Text>
+        <Text dimColor>{'-'.repeat(Math.max(1, columns - 1))}</Text>
         {options.map(([label, value], index) => (
-          <Text key={label} inverse={index === selectedIndex}>{label!.padEnd(20)} {value}</Text>
+          <Text key={label} inverse={index === selectedIndex} wrap="truncate-end">{index === selectedIndex ? '> ' : '  '}{label!.padEnd(18)} {value}</Text>
         ))}
+        {Array.from({length: fillerCount}, (_, index) => <Text key={`settings-filler:${index}`}> </Text>)}
       </Box>
-      <StatusLine busy="" status={status} error={error} />
+      <Text dimColor>keys: enter/right open/toggle  ↑↓ select  s/esc/q back</Text>
+      {error || status
+        ? <StatusLine busy="" status={status} error={error} />
+        : <Text dimColor wrap="truncate-end">info  config {sanitizeText(configPath)}</Text>}
     </Box>
   );
 }
 
-function BrowserScreen({options, selectedIndex}: {options: ReturnType<typeof browserOptions>; selectedIndex: number}) {
+function BrowserScreen({options, selectedIndex, savedBrowser, activeBrowser, columns, terminalRows}: {
+  options: readonly BrowserOption[];
+  selectedIndex: number;
+  savedBrowser: string;
+  activeBrowser: string;
+  columns: number;
+  terminalRows: number;
+}) {
+  const pageSize = Math.max(1, terminalRows - 6);
+  const offset = clamp(selectedIndex - Math.floor(pageSize / 2), 0, Math.max(0, options.length - pageSize));
+  const visible = options.slice(offset, offset + pageSize);
   return (
-    <Box flexDirection="column">
-      <Text bold color="cyan">PORTWARDEN  [BROWSER]</Text>
-      <Text dimColor>enter save · ↑↓ select · esc/q back</Text>
+    <Box flexDirection="column" width={columns}>
+      <Text bold color="cyan">BROWSER</Text>
+      <Text dimColor wrap="truncate-end">saved {sanitizeText(savedBrowser) || 'System default browser'}  active {sanitizeText(activeBrowser) || 'system'}</Text>
       <Box flexDirection="column" marginTop={1}>
-        {options.map((option, index) => (
-          <Text key={`${option.label}:${option.value}`} inverse={index === selectedIndex}>{option.label}</Text>
-        ))}
+        <Text bold>BROWSER LIST</Text>
+        <Text dimColor>{'-'.repeat(Math.max(1, columns - 1))}</Text>
+        {visible.map((option, index) => {
+          const absoluteIndex = offset + index;
+          const saved = option.value === savedBrowser || (!option.value && !savedBrowser);
+          const active = option.value === activeBrowser || (!option.value && !activeBrowser);
+          const suffix = saved && active ? '  saved · active' : saved ? '  saved' : active ? '  active' : '';
+          return (
+            <Text
+              key={`${option.label}:${option.value}`}
+              inverse={absoluteIndex === selectedIndex}
+              color={saved ? 'green' : active ? 'cyan' : undefined}
+              wrap="truncate-end"
+            >
+              {absoluteIndex === selectedIndex ? '> ' : '  '}{option.label}{suffix}
+            </Text>
+          );
+        })}
+        {Array.from({length: Math.max(0, pageSize - visible.length)}, (_, index) => <Text key={`browser-filler:${index}`}> </Text>)}
       </Box>
+      <Text dimColor>keys: enter save  ↑↓ select  s/esc/q back</Text>
     </Box>
   );
 }
@@ -694,33 +959,51 @@ function GraveyardScreen(props: {
   status: string;
   error: string;
   busy: string;
+  warning: string;
   columns: number;
   terminalRows: number;
+  confirmation: Confirmation | null;
 }) {
   const selected = props.records[props.selectedIndex];
-  const pageSize = Math.max(3, props.terminalRows - 10);
+  const pageSize = Math.max(1, props.terminalRows - 9);
   const offset = clamp(props.selectedIndex - Math.floor(pageSize / 2), 0, Math.max(0, props.records.length - pageSize));
+  const visible = props.records.slice(offset, offset + pageSize);
   return (
     <Box flexDirection="column" width={props.columns}>
-      <Text bold color="cyan">PORTWARDEN  [GRAVEYARD] <Text color="gray">[{props.records.length} saved]</Text></Text>
-      <Text dimColor>↑↓ select · r revive · d discard · esc/g/s/q back</Text>
+      <Text bold color="cyan">GRAVEYARD  (kills 보관소)</Text>
+      <Text dimColor>total {props.records.length}  logs ~/.portwarden/logs/&lt;slug&gt;.log</Text>
       <Box flexDirection="column" marginTop={1}>
-        {props.records.length === 0 ? <Text dimColor>The graveyard is empty.</Text> : props.records.slice(offset, offset + pageSize).map((record, index) => {
+        {props.records.length === 0 ? (
+          <Text dimColor>아직 x / f 로 죽인 항목이 없습니다.</Text>
+        ) : (
+          <>
+            <Text dimColor>  PORT   PROJECT               STATE  KILLED               CMD</Text>
+            <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
+          </>
+        )}
+        {visible.map((record, index) => {
           const alive = props.listeners.some(({port}) => port === record.port);
+          const command = formatCommandForDisplay({argv: record.argv, env: record.env});
           return (
-            <Text key={record.id} inverse={offset + index === props.selectedIndex} color={alive ? 'green' : 'gray'}>
-              {alive ? 'alive' : 'dead '}  :{String(record.port).padEnd(6)}  {record.project.padEnd(20)}  {formatCapturedAt(record.capturedAt)}
+            <Text key={record.id} inverse={offset + index === props.selectedIndex} color={alive ? 'green' : 'gray'} wrap="truncate-end">
+              {offset + index === props.selectedIndex ? '> ' : '  '}
+              {String(record.port).padEnd(7)}{padDisplayText(record.project, 21)} {(alive ? 'alive' : 'dead').padEnd(7)}
+              {fitText(formatCapturedAt(record.capturedAt), 19).padEnd(20)}{command}
             </Text>
           );
         })}
+        {Array.from({length: Math.max(0, pageSize - Math.max(1, visible.length))}, (_, index) => <Text key={`graveyard-filler:${index}`}> </Text>)}
       </Box>
       {selected ? (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>cwd {sanitizeText(selected.cwd)}</Text>
+        <Box flexDirection="column">
+          <Text dimColor wrap="truncate-end">cwd {sanitizeText(selected.cwd)}</Text>
           <Text dimColor wrap="truncate-end">cmd {formatCommandForDisplay({argv: selected.argv, env: selected.env})}</Text>
         </Box>
-      ) : null}
-      <StatusLine busy={props.busy} status={props.status} error={props.error} />
+      ) : <><Text> </Text><Text> </Text></>}
+      <Text dimColor>keys: r revive  d drop  ↑↓ select  g/s/esc/q back</Text>
+      {props.confirmation
+        ? <ConfirmationBox confirmation={props.confirmation} />
+        : <StatusLine busy={props.busy} status={props.status} error={props.error} warning={props.warning} />}
     </Box>
   );
 }
@@ -728,10 +1011,13 @@ function GraveyardScreen(props: {
 function HelpScreen() {
   return (
     <Box flexDirection="column">
-      <Text bold color="cyan">PORTWARDEN  [HELP]</Text>
+      <Text bold color="cyan">HELP</Text>
+      <Text dimColor>PORTWARDEN keyboard reference</Text>
+      <Text> </Text>
       <Text>↑/↓      move selection</Text>
-      <Text>←/→      reorder a listener · collapse/expand an app group</Text>
-      <Text>a        toggle dev/all LISTEN ports</Text>
+      <Text>←/→      reorder a listener · collapse/expand a group</Text>
+      <Text>enter    expand/collapse an app group</Text>
+      <Text>a        toggle main/all LISTEN ports</Text>
       <Text>z        show/hide orphaned browser-automation processes</Text>
       <Text>p        pin/unpin one listener (pinned listeners cannot be stopped)</Text>
       <Text>o / m    open in browser / safely move to the next verified port</Text>
@@ -757,30 +1043,102 @@ function useTerminalSize(): {columns: number; rows: number} {
   return size;
 }
 
-function tableWidths(columns: number): number[] {
+function tableWidths(columns: number, showKind: boolean): number[] {
+  const available = Math.max(1, columns - 2);
   if (columns < 32) {
-    return [0, 0, 6, 0, 0, 0, 0, Math.max(1, columns - 6)];
+    return [0, 0, 6, 0, 0, 0, 0, Math.max(1, available - 7)];
   }
   if (columns < 50) {
-    return [0, 0, 6, 7, 0, 0, 10, Math.max(1, columns - 23)];
+    return [0, 0, 6, 7, 0, 0, 10, Math.max(1, available - 26)];
   }
-  if (columns < 74) {
-    return [7, 3, 6, 7, 0, 0, 15, Math.max(12, columns - 38)];
+  if (columns < 65) {
+    const kind = showKind ? 6 : 0;
+    const process = Math.max(8, available - kind - 3 - 5 - 6 - 14 - (showKind ? 5 : 4));
+    return [kind, 3, 5, 6, 0, 0, 14, process];
   }
-  if (columns < 100) {
-    return [8, 4, 7, 8, 0, 12, 18, Math.max(16, columns - 57)];
+  if (columns < 80) {
+    const kind = showKind ? 6 : 0;
+    const process = Math.max(10, available - kind - 3 - 5 - 6 - 8 - 14 - (showKind ? 6 : 5));
+    return [kind, 3, 5, 6, 8, 0, 14, process];
   }
-  return [9, 4, 7, 8, 12, 14, 20, Math.max(20, columns - 74)];
+  const usable = Math.max(80, columns - 2);
+  const kind = showKind ? 6 : 0;
+  const pin = 3;
+  const port = 5;
+  const pid = 6;
+  const age = 8;
+  const host = Math.max(10, Math.floor(usable * 0.14));
+  const project = Math.max(16, Math.floor(usable * 0.18));
+  const fixed = kind + pin + port + pid + age + host + project;
+  const spaces = showKind ? 8 : 7;
+  const process = Math.max(24, usable - fixed - spaces);
+  return [kind, pin, port, pid, age, host, project, process];
 }
 
-function browserOptions(current: string): Array<{label: string; value: string}> {
-  return current && !BROWSERS.some(({value}) => value === current)
-    ? [...BROWSERS, {label: current, value: current}]
-    : BROWSERS;
+function nextAvailablePort(listeners: readonly ListenerEntry[], currentPort: number): number | '-' {
+  const used = new Set(listeners.map(({port}) => port));
+  for (let port = currentPort + 1; port <= 65_535; port += 1) {
+    if (!used.has(port)) return port;
+  }
+  return '-';
+}
+
+function fitText(value: string, width: number): string {
+  return truncateDisplayText(sanitizeText(value), width);
+}
+
+function truncateRawText(value: string, width: number): string {
+  return truncateDisplayText(value, width);
+}
+
+function padDisplayText(value: string, width: number): string {
+  const text = truncateDisplayText(value, width);
+  return text + ' '.repeat(Math.max(0, width - displayWidth(text)));
+}
+
+function truncateDisplayText(value: string, width: number): string {
+  if (width <= 0) return '';
+  if (displayWidth(value) <= width) return value;
+  if (width === 1) return '…';
+  const target = width - 1;
+  let result = '';
+  let used = 0;
+  for (const character of value) {
+    const characterWidth = displayCharacterWidth(character);
+    if (used + characterWidth > target) break;
+    result += character;
+    used += characterWidth;
+  }
+  return `${result}…`;
+}
+
+function displayWidth(value: string): number {
+  let width = 0;
+  for (const character of value) width += displayCharacterWidth(character);
+  return width;
+}
+
+function displayCharacterWidth(character: string): number {
+  const codePoint = character.codePointAt(0) ?? 0;
+  return codePoint >= 0x1100 && (
+    codePoint <= 0x115f || codePoint === 0x2329 || codePoint === 0x232a ||
+    (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
+    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
+    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
+    (codePoint >= 0x1f300 && codePoint <= 0x1f64f) ||
+    (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) ||
+    (codePoint >= 0x20000 && codePoint <= 0x3fffd)
+  ) ? 2 : 1;
 }
 
 function formatClock(date: Date): string {
-  return date.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+  return [date.getHours(), date.getMinutes(), date.getSeconds()]
+    .map((value) => String(value).padStart(2, '0'))
+    .join(':');
 }
 
 function formatSeconds(seconds: number | null): string {

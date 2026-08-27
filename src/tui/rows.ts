@@ -3,7 +3,7 @@ import {redactCommandLine, sanitizeText} from '../core/commands.js';
 import type {ListenerEntry, ZombieCandidate} from '../core/types.js';
 
 export type VisibleRow =
-  | {type: 'listener'; key: string; listener: ListenerEntry; depth: number}
+  | {type: 'listener'; key: string; listener: ListenerEntry; depth: number; parentGroupKey?: string}
   | {type: 'group'; key: string; family: string; members: ListenerEntry[]; expanded: boolean; depth: 0}
   | {type: 'zombie'; key: string; zombie: ZombieCandidate; depth: 0};
 
@@ -22,15 +22,20 @@ export function buildVisibleRows(
   const query = sanitizeText(options.query).toLowerCase();
   const matches = (entry: ListenerEntry) => !query || listenerSearchText(entry).includes(query);
   const listenerRows: VisibleRow[] = [];
+  const groupedRows: VisibleRow[] = [];
   const eligible = listeners.filter(matches);
-  const grouped = new Map<string, {family: string; members: ListenerEntry[]; pinned: boolean}>();
+  const grouped = new Map<string, {family: string; members: ListenerEntry[]}>();
 
   for (const listener of eligible) {
-    if (options.all && listener.kind === 'app' && listener.appFamily) {
+    if (
+      options.all &&
+      listener.kind === 'app' &&
+      listener.appFamily &&
+      !listenerIsPinned(listener, options.pinnedListenerKeys)
+    ) {
       const family = listener.appFamily;
-      const pinned = listenerIsPinned(listener, options.pinnedListenerKeys);
-      const bucketKey = `${pinned ? 'pinned' : 'regular'}:${family.toLowerCase()}`;
-      const bucket = grouped.get(bucketKey) ?? {family, members: [], pinned};
+      const bucketKey = family.toLowerCase();
+      const bucket = grouped.get(bucketKey) ?? {family, members: []};
       bucket.members.push(listener);
       grouped.set(bucketKey, bucket);
     }
@@ -38,13 +43,19 @@ export function buildVisibleRows(
 
   const emittedGroups = new Set<string>();
   for (const listener of eligible) {
-    if (!(options.all && listener.kind === 'app' && listener.appFamily)) {
+    if (
+      !(
+        options.all &&
+        listener.kind === 'app' &&
+        listener.appFamily &&
+        !listenerIsPinned(listener, options.pinnedListenerKeys)
+      )
+    ) {
       listenerRows.push(listenerRow(listener));
       continue;
     }
 
-    const pinned = listenerIsPinned(listener, options.pinnedListenerKeys);
-    const bucketKey = `${pinned ? 'pinned' : 'regular'}:${listener.appFamily.toLowerCase()}`;
+    const bucketKey = listener.appFamily.toLowerCase();
     const bucket = grouped.get(bucketKey)!;
     if (bucket.members.length < 2) {
       listenerRows.push(listenerRow(listener));
@@ -54,18 +65,18 @@ export function buildVisibleRows(
       continue;
     }
     emittedGroups.add(bucketKey);
-    const groupKey = `group:${bucketKey}`;
-    const expanded = Boolean(query) || options.expandedGroups.has(groupKey);
-    listenerRows.push({type: 'group', key: groupKey, family: bucket.family, members: bucket.members, expanded, depth: 0});
+    const groupKey = `group:regular:${bucketKey}`;
+    const expanded = options.expandedGroups.has(groupKey);
+    groupedRows.push({type: 'group', key: groupKey, family: bucket.family, members: bucket.members, expanded, depth: 0});
     if (expanded) {
-      listenerRows.push(...bucket.members.map((member) => listenerRow(member, 1)));
+      groupedRows.push(...bucket.members.map((member) => listenerRow(member, 1, groupKey)));
     }
   }
 
   const zombieRows = zombies
     .filter((zombie) => !query || zombieSearchText(zombie).includes(query))
     .map<VisibleRow>((zombie) => ({type: 'zombie', key: `zombie:${zombie.pid}`, zombie, depth: 0}));
-  return [...listenerRows, ...zombieRows];
+  return [...listenerRows, ...groupedRows, ...zombieRows];
 }
 
 export function listenerIsPinned(listener: ListenerEntry, pinnedListenerKeys: readonly string[]): boolean {
@@ -83,8 +94,8 @@ export function rowLabel(row: VisibleRow): string {
   return `${row.family} (${row.members.length})`;
 }
 
-function listenerRow(listener: ListenerEntry, depth = 0): VisibleRow {
-  return {type: 'listener', key: `listener:${selectionKey(listener)}`, listener, depth};
+function listenerRow(listener: ListenerEntry, depth = 0, parentGroupKey?: string): VisibleRow {
+  return {type: 'listener', key: `listener:${selectionKey(listener)}`, listener, depth, parentGroupKey};
 }
 
 function listenerSearchText(entry: ListenerEntry): string {
