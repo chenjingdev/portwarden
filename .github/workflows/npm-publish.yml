@@ -10,7 +10,34 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  validate:
+    strategy:
+      matrix:
+        node-version: [20.5.0, 24]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate package
+        run: |
+          pnpm check
+          npm pack --dry-run
+
   publish:
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -19,14 +46,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          cache: pnpm
 
-      - name: Enable pnpm
-        run: corepack enable
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Read package metadata
         id: pkg
@@ -34,11 +65,8 @@ jobs:
           echo "name=$(node -p "require('./package.json').name")" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Validate package
-        run: |
-          node --check dev-ports.js lib/*.js test/*.js
-          pnpm test
-          npm publish --dry-run --access public
+      - name: Build package
+        run: pnpm build
 
       - name: Check published version
         id: registry
@@ -51,7 +79,7 @@ jobs:
 
       - name: Publish package
         if: steps.registry.outputs.exists != 'true'
-        run: npm publish --access public
+        run: npm publish --access public --provenance
 
       - name: Skip duplicate version
         if: steps.registry.outputs.exists == 'true'

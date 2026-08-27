@@ -1,8 +1,9 @@
 {
   "name": "portwarden",
-  "version": "0.3.1",
-  "description": "Small CLI for inspecting and cleaning up active dev ports",
-  "author": "김아람 <chenjing@laonpeople.com>",
+  "version": "1.0.0",
+  "description": "Fast interactive port and orphaned-process manager for local development",
+  "type": "module",
+  "author": "chenjingdev",
   "license": "MIT",
   "homepage": "https://github.com/chenjingdev/portwarden#readme",
   "bugs": {
@@ -13,8 +14,7 @@
     "url": "git+https://github.com/chenjingdev/portwarden.git"
   },
   "files": [
-    "dev-ports.js",
-    "lib",
+    "dist",
     "README.md",
     "LICENSE"
   ],
@@ -23,20 +23,59 @@
     "ports",
     "dev-server",
     "tui",
-    "vite",
-    "process"
+    "process",
+    "playwright",
+    "zombie"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20.5.0"
   },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "packageManager": "pnpm@10.34.5",
   "bin": {
-    "portwarden": "dev-ports.js"
+    "portwarden": "dist/cli.js"
   },
   "scripts": {
-    "start": "node ./dev-ports.js",
-    "watch": "node ./dev-ports.js --plain --watch",
-    "plain": "node ./dev-ports.js --plain",
-    "tui": "node ./dev-ports.js --tui",
-    "test": "node --test"
+    "build": "tsup",
+    "dev": "tsx src/cli.tsx",
+    "start": "node dist/cli.js",
+    "plain": "tsx src/cli.tsx --plain",
+    "tui": "tsx src/cli.tsx --tui",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test && pnpm build",
+    "prepack": "corepack pnpm build",
+    "prepublishOnly": "corepack pnpm check"
+  },
+  "dependencies": {
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.3",
+    "conf": "^15.1.0",
+    "execa": "^9.6.1",
+    "get-port": "^7.2.0",
+    "ink": "^6.8.0",
+    "open": "^11.0.1",
+    "ps-list": "^9.0.0",
+    "react": "^19.2.8",
+    "shell-quote": "^1.10.0",
+    "strip-ansi": "^7.2.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/react": "^19.2.18",
+    "@types/shell-quote": "^1.7.5",
+    "@vitest/coverage-v8": "^3.2.7",
+    "ink-testing-library": "^4.0.0",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
   }
 }
