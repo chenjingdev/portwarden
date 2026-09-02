@@ -273,6 +273,17 @@ describe('classification and identity', () => {
     expect(classifyListener({command: 'postgres', cwd: '/opt/postgres', port: 5432})).toBe('system');
   });
 
+  it('does not treat an ancillary Application Support argument as the process app identity', () => {
+    expect(classifyListener({
+      command: 'python3.12',
+      executable: '/Users/test/ComfyUI/.venv/bin/python3',
+      args: '/Users/test/ComfyUI/.venv/bin/python3 ComfyUI/main.py --extra-model-paths-config /Users/test/Library/Application Support/Comfy Desktop/models.yaml',
+      cwd: '/Users/test/ComfyUI-Installs/ComfyUI',
+      port: 8000,
+      home: '/Users/test',
+    })).toBe('dev');
+  });
+
   it('keeps pnpm dlx package inference from the original implementation', () => {
     expect(getProjectName({
       cwd: '/',
@@ -309,6 +320,30 @@ describe('host collapsing, keys, selection, and sorting', () => {
       all: false,
       pinnedListenerKeys: [listenerKey('::1', 3000)],
     })).toEqual([merged]);
+  });
+
+  it('shows service-like app listeners by default without exposing ordinary app helpers', () => {
+    const dev = entry({pid: 1, port: 3000});
+    const ollamaService = entry({
+      pid: 2,
+      port: 11434,
+      kind: 'app',
+      appFamily: 'Ollama',
+      command: 'ollama',
+      args: '/Applications/Ollama.app/Contents/Resources/ollama serve',
+      cwd: '/',
+    });
+    const ollamaApp = entry({
+      pid: 3,
+      port: 49880,
+      kind: 'app',
+      appFamily: 'Ollama',
+      command: 'Ollama',
+      args: '/Applications/Ollama.app/Contents/MacOS/Ollama',
+      cwd: '/',
+    });
+
+    expect(selectListeners([ollamaApp, ollamaService, dev], {all: false}).map(({pid}) => pid)).toEqual([1, 2]);
   });
 
   it('normalizes mutable ports in preference keys', () => {

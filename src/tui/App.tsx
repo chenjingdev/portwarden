@@ -523,7 +523,7 @@ export function PortwardenApp({
     } else if (normalized === 'a') {
       pendingSelectionKey.current = null;
       setAll((value) => !value);
-      setStatus(all ? 'Showing pinned + dev ports.' : 'Showing all LISTEN ports.');
+      setStatus(all ? 'Showing relevant + pinned ports.' : 'Showing all LISTEN ports.');
     } else if (normalized === 'z') {
       pendingSelectionKey.current = null;
       setShowZombies((value) => !value);
@@ -706,7 +706,7 @@ function MainTable(props: {
       <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
       <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
       {visible.length === 0 ? (
-        <Text color="yellow">  {props.all ? 'No LISTEN ports found.' : 'No pinned or dev ports found.'}</Text>
+        <Text color="yellow">  {props.all ? 'No LISTEN ports found.' : 'No relevant or pinned ports found.'}</Text>
       ) : visible.map((row, localIndex) => (
         <DataRow
           key={row.key}

@@ -127,6 +127,7 @@ export interface ListenerDetails {
   cwd?: string;
   command?: string;
   args?: string;
+  executable?: string;
   appFamily?: string;
   port?: number;
   home?: string;
@@ -466,13 +467,14 @@ export function enrichListener(
   const home = options.home ?? homedir();
   const args = processInfo?.command ?? '';
   const command = base.command || processInfo?.name || firstToken(args) || '-';
-  const appFamily = inferAppFamily({cwd, command, args});
+  const executable = processInfo?.executable ?? '';
+  const appFamily = inferAppFamily({cwd, command, args, executable});
   const projectName = getProjectName({cwd, command, args, home});
   const startTime = processInfo?.startTime;
   const ageMs = processInfo?.ageMs ?? (
     startTime ? Math.max(0, (options.now ?? new Date()).getTime() - startTime.getTime()) : undefined
   );
-  const details = {cwd, command, args, appFamily, port: endpoint.port, home};
+  const details = {cwd, command, args, executable, appFamily, port: endpoint.port, home};
 
   return {
     pid: base.pid,
@@ -529,13 +531,12 @@ export function matchesKeyword(text: string, keyword: string): boolean {
   return new RegExp(`(^|[^a-z0-9])${escaped}(?=$|[^a-z0-9])`, 'i').test(text);
 }
 
-export function classifyListener(details: ListenerDetails): ListenerKind {
+function hasDevEvidence(details: ListenerDetails): boolean {
   const home = details.home ?? homedir();
   const cwd = details.cwd?.trim() ?? '';
   const command = details.command?.trim() ?? '';
   const commandName = path.basename(command).toLowerCase();
   const searchText = [command, details.args, cwd].filter(Boolean).join(' ');
-  const appFamily = details.appFamily?.trim() ?? inferAppFamily(details);
   const inHome = cwd === home || cwd.startsWith(`${home}${path.sep}`);
   const inLibrary = cwd === path.join(home, 'Library') || cwd.startsWith(`${path.join(home, 'Library')}${path.sep}`);
   const hasProjectCwd = Boolean(cwd) && inHome && !inLibrary && cwd !== home;
@@ -543,19 +544,26 @@ export function classifyListener(details: ListenerDetails): ListenerKind {
   const runtime = RUNTIME_NAMES.has(commandName);
   const port = details.port ?? 0;
   const commonDevPort = DEV_PORTS.has(port) || (port >= 3000 && port <= 5999);
+  return hasDevKeyword || (hasProjectCwd && (runtime || commonDevPort)) || (runtime && commonDevPort);
+}
+
+export function classifyListener(details: ListenerDetails): ListenerKind {
+  const appFamily = details.appFamily?.trim() ?? inferAppFamily(details);
 
   // Packaged desktop helpers commonly contain dev-looking words in their
   // resource path/argv (for example Ollama.app's `Resources/ollama serve`).
   // The bundle identity is stronger evidence than a generic CLI keyword.
   if (appFamily) return 'app';
-  if (hasDevKeyword || (hasProjectCwd && (runtime || commonDevPort)) || (runtime && commonDevPort)) {
-    return 'dev';
-  }
+  if (hasDevEvidence(details)) return 'dev';
   return 'system';
 }
 
-export function inferAppFamily(details: Pick<ListenerDetails, 'cwd' | 'command' | 'args'>): string {
-  for (const input of [details.args, details.command, details.cwd]) {
+export function inferAppFamily(details: Pick<ListenerDetails, 'cwd' | 'command' | 'args' | 'executable'>): string {
+  // Only process-identity paths may identify an app bundle. Arbitrary argv
+  // values can point into another app's Application Support directory (for
+  // example ComfyUI loading a Comfy Desktop model-path config).
+  const argvExecutable = firstToken(details.args ?? '');
+  for (const input of [details.executable, argvExecutable, details.command, details.cwd]) {
     const normalized = input?.trim().replace(/[\\/]+/g, '/');
     if (!normalized) continue;
     const application = /\/(?:System\/)?Applications\/([^/]+)\.app(?:\/|$)/.exec(normalized);
@@ -689,9 +697,14 @@ export function selectListeners(
   const selected = options.all
     ? entries
     : entries.filter(
-      (entry) => entry.kind === 'dev' || listenerKeys(entry).some((key) => pinned.has(key)),
+      (entry) => isDefaultVisibleListener(entry) || listenerKeys(entry).some((key) => pinned.has(key)),
     );
   return sortListeners(selected, options);
+}
+
+/** Keep legacy-relevant local services visible without treating app bundles as dev process groups. */
+export function isDefaultVisibleListener(entry: ListenerEntry): boolean {
+  return entry.kind === 'dev' || (entry.kind === 'app' && hasDevEvidence(entry));
 }
 
 export function compareListeners(left: ListenerEntry, right: ListenerEntry): number {

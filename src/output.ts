@@ -34,7 +34,7 @@ export function renderOutput(
   const shown = listeners.length + zombies.length;
   const hidden = Math.max(0, allListenerCount - listeners.length);
   const lines = [
-    `${options.all ? 'All LISTEN ports' : 'Pinned + dev ports'}: ${listeners.length}${zombies.length ? ` · zombies: ${zombies.length}` : ''}`,
+    `${options.all ? 'All LISTEN ports' : 'Relevant + pinned ports'}: ${listeners.length}${zombies.length ? ` · zombies: ${zombies.length}` : ''}`,
     `Updated: ${new Date().toLocaleString()}`,
   ];
   if (!options.all && hidden > 0) {
@@ -46,7 +46,7 @@ export function renderOutput(
   lines.push('');
 
   if (shown === 0) {
-    lines.push(options.all ? 'No LISTEN ports found.' : 'No pinned or dev-like LISTEN ports found.');
+    lines.push(options.all ? 'No LISTEN ports found.' : 'No relevant or pinned LISTEN ports found.');
     return lines.join('\n');
   }
 
