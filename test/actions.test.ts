@@ -7,6 +7,8 @@ import {afterEach, describe, expect, it, vi} from 'vitest';
 import {ConfigRepository, type GraveyardRecord, type PortwardenConfig} from '../src/config.js';
 import {
   captureGraveyardRecord,
+  listenerSharesStopScope,
+  listenerStopProcessGroup,
   PortwardenActions,
   type ActionDependencies,
 } from '../src/core/actions.js';
@@ -28,6 +30,8 @@ type Kill = NonNullable<ActionDependencies['kill']>;
 type FindPort = NonNullable<ActionDependencies['getPort']>;
 type Launch = NonNullable<ActionDependencies['launch']>;
 type LaunchedProcess = ReturnType<Launch>;
+type CollectProcessGroupMembers = NonNullable<ActionDependencies['collectProcessGroupMembers']>;
+type ProcessGroupExists = NonNullable<ActionDependencies['processGroupExists']>;
 
 afterEach(() => {
   vi.useRealTimers();
@@ -137,6 +141,25 @@ function deferred<T>(): {
   return {promise, resolve};
 }
 
+describe('listener stop scope', () => {
+  it('uses a foreign process group but never Portwarden own group as the stop scope', () => {
+    const grouped = listener({pid: 1_001, pgid: 9_000, collectorPgid: 8_000});
+    const sameGroup = listener({pid: 1_002, pgid: 9_000, collectorPgid: 8_000});
+    const otherGroup = listener({pid: 1_003, pgid: 9_001, collectorPgid: 8_000});
+
+    expect(listenerStopProcessGroup(grouped)).toBe(9_000);
+    expect(listenerSharesStopScope(grouped, sameGroup)).toBe(true);
+    expect(listenerSharesStopScope(grouped, otherGroup)).toBe(false);
+    expect(listenerStopProcessGroup(listener({pgid: 8_000, collectorPgid: 8_000}))).toBeNull();
+    expect(listenerStopProcessGroup(listener({kind: 'app', pgid: 9_000, collectorPgid: 8_000}))).toBeNull();
+    expect(listenerStopProcessGroup(listener({kind: 'system', pgid: 9_000, collectorPgid: 8_000}))).toBeNull();
+    expect(listenerSharesStopScope(
+      listener({kind: 'app', pid: 1_001, pgid: 9_000, collectorPgid: 8_000}),
+      sameGroup,
+    )).toBe(false);
+  });
+});
+
 describe('stopListener safety', () => {
   it('preflights a listener without sending a signal or mutating config', async () => {
     const current = listener();
@@ -147,6 +170,31 @@ describe('stopListener safety', () => {
     await expect(actions.validateListener(current)).resolves.toEqual(current);
     expect(kill).not.toHaveBeenCalled();
     expect(config.get()).toEqual(before);
+  });
+
+  it('allows force-stop after fresh revalidation when only the executable path is unavailable', async () => {
+    const incomplete = listener({executable: undefined});
+    const collect = sequentialCollector([incomplete], []);
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(repository(), {collect, kill});
+
+    await expect(actions.stopListener(incomplete, 'SIGKILL')).resolves.toMatchObject({
+      pid: incomplete.pid,
+    });
+    expect(kill).toHaveBeenCalledWith(incomplete.pid, 'SIGKILL');
+  });
+
+  it('keeps graceful stop fail-closed when the executable path is unavailable', async () => {
+    const incomplete = listener({executable: undefined});
+    const collect = vi.fn<Collect>(async () => [incomplete]);
+    const kill = vi.fn<Kill>();
+    const actions = new PortwardenActions(repository(), {collect, kill});
+
+    await expect(actions.stopListener(incomplete, 'SIGTERM')).rejects.toMatchObject({
+      code: 'STALE_PROCESS',
+    });
+    expect(collect).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
   });
 
   it('refuses to kill a pinned listener before process collection', async () => {
@@ -190,6 +238,162 @@ describe('stopListener safety', () => {
 
     await expect(actions.stopListener(selected, 'SIGTERM')).rejects.toMatchObject({code: 'PINNED'});
     expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('blocks a stop when another PID in the same process group owns a pinned listener', async () => {
+    const selected = listener({pid: 1_000, pgid: 9_000, collectorPgid: 8_000});
+    const pinnedSibling = listener({
+      pid: 1_001,
+      ppid: selected.pid,
+      pgid: selected.pgid,
+      collectorPgid: selected.collectorPgid,
+      port: 3_001,
+      args: 'vite --port 3001',
+      displayCommand: 'vite --port 3001',
+    });
+    const config = repository({pinnedListenerKeys: [listenerKey(pinnedSibling)]});
+    const collect = vi.fn<Collect>(async () => [selected, pinnedSibling]);
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async () => []);
+    const actions = new PortwardenActions(config, {collect, kill, collectProcessGroupMembers});
+
+    await expect(actions.stopListener(selected, 'SIGKILL')).rejects.toMatchObject({code: 'PINNED'});
+    expect(collectProcessGroupMembers).not.toHaveBeenCalled();
+    expect(kill).not.toHaveBeenCalled();
+  });
+
+  it('sends SIGKILL to a verified foreign process group', async () => {
+    const current = listener({pid: 1_001, ppid: 9_000, pgid: 9_000, collectorPgid: 8_000});
+    let groupExists = true;
+    const kill = vi.fn<Kill>((pid) => {
+      if (pid === -current.pgid!) groupExists = false;
+    });
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async (pgid) => [
+      {pid: pgid, ppid: 1, pgid, uid: current.uid},
+      {pid: current.pid, ppid: pgid, pgid, uid: current.uid},
+    ]);
+    const processGroupExists = vi.fn<ProcessGroupExists>(() => groupExists);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+      processGroupExists,
+    });
+
+    await expect(actions.stopListener(current, 'SIGKILL')).resolves.toMatchObject({pid: current.pid});
+    expect(collectProcessGroupMembers.mock.calls[0]?.[0]).toBe(current.pgid);
+    expect(kill).toHaveBeenCalledWith(-current.pgid!, 'SIGKILL');
+  });
+
+  it('falls back to the listener PID instead of signalling Portwarden own process group', async () => {
+    const current = listener({pgid: 8_000, collectorPgid: 8_000});
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async () => []);
+    const processGroupExists = vi.fn<ProcessGroupExists>(() => true);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+      processGroupExists,
+    });
+
+    await expect(actions.stopListener(current, 'SIGKILL')).resolves.toMatchObject({pid: current.pid});
+    expect(kill).toHaveBeenCalledWith(current.pid, 'SIGKILL');
+    expect(collectProcessGroupMembers).not.toHaveBeenCalled();
+    expect(processGroupExists).not.toHaveBeenCalled();
+  });
+
+  it.each(['app', 'system'] as const)('stops a %s listener by PID even with foreign process-group metadata', async (kind) => {
+    const current = listener({kind, pgid: 9_000, collectorPgid: 8_000});
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async (pgid) => [
+      {pid: current.pid, ppid: 1, pgid, uid: current.uid},
+    ]);
+    const processGroupExists = vi.fn<ProcessGroupExists>(() => false);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+      processGroupExists,
+    });
+
+    const outcome = await actions.stopListener(current, 'SIGKILL');
+
+    expect(outcome.pgid).toBeUndefined();
+    expect(kill).toHaveBeenCalledWith(current.pid, 'SIGKILL');
+    expect(collectProcessGroupMembers).not.toHaveBeenCalled();
+    expect(processGroupExists).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['another owner', (uid: number) => uid + 1],
+    ['an unknown owner', () => undefined],
+  ])('falls back to the listener PID when the process group contains %s', async (_label, memberUid) => {
+    const current = listener({pgid: 9_000, collectorPgid: 8_000});
+    const uid = current.uid ?? 501;
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async (pgid) => [
+      {pid: current.pid, ppid: 1, pgid, uid},
+      {pid: 1_001, ppid: current.pid, pgid, uid: memberUid(uid)},
+    ]);
+    const processGroupExists = vi.fn<ProcessGroupExists>(() => true);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+      processGroupExists,
+    });
+
+    await expect(actions.stopListener(current, 'SIGKILL')).resolves.toMatchObject({pid: current.pid});
+    expect(kill).toHaveBeenCalledWith(current.pid, 'SIGKILL');
+    expect(kill).not.toHaveBeenCalledWith(-current.pgid!, 'SIGKILL');
+  });
+
+  it('falls back to the listener PID when its group contains a Portwarden ancestor', async () => {
+    const current = listener({pgid: 9_000, collectorPgid: 8_000});
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async (pgid) => [
+      {pid: 7_000, ppid: 1, pgid, uid: current.uid, isCollectorAncestor: true},
+      {pid: current.pid, ppid: 7_000, pgid, uid: current.uid},
+    ]);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+    });
+
+    await expect(actions.stopListener(current, 'SIGKILL')).resolves.toMatchObject({
+      warning: expect.stringContaining('parent session'),
+    });
+    expect(kill).toHaveBeenCalledWith(current.pid, 'SIGKILL');
+  });
+
+  it('reports a partial group cleanup when the port closes but group members remain', async () => {
+    vi.useFakeTimers();
+    const current = listener({pid: 1_001, ppid: 9_000, pgid: 9_000, collectorPgid: 8_000});
+    const kill = vi.fn<Kill>();
+    const collectProcessGroupMembers = vi.fn<CollectProcessGroupMembers>(async (pgid) => [
+      {pid: pgid, ppid: 1, pgid, uid: current.uid},
+      {pid: current.pid, ppid: pgid, pgid, uid: current.uid},
+    ]);
+    const processGroupExists = vi.fn<ProcessGroupExists>(() => true);
+    const actions = new PortwardenActions(repository(), {
+      collect: sequentialCollector([current], []),
+      kill,
+      collectProcessGroupMembers,
+      processGroupExists,
+    });
+
+    const pending = actions.stopListener(current, 'SIGKILL');
+    await vi.runAllTimersAsync();
+    const outcome = await pending;
+    expect(outcome).toMatchObject({
+      pid: current.pid,
+      warning: expect.stringContaining('still has running members'),
+    });
+    expect(outcome).not.toHaveProperty('pgid');
+
+    expect(kill).toHaveBeenCalledWith(-current.pgid!, 'SIGKILL');
   });
 
   it.each([

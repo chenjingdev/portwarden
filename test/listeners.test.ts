@@ -12,6 +12,8 @@ import {
   parseEndpoint,
   parseLsofCwds,
   parseLsofListeners,
+  parseLsofProcessMetadata,
+  parsePsProcessTable,
   selectListeners,
   sortListeners,
 } from '../src/core/listeners.js';
@@ -67,6 +69,58 @@ describe('lsof parsing and enrichment', () => {
     );
   });
 
+  it('parses cwd and the first lsof text executable without accepting later mappings', () => {
+    expect(parseLsofProcessMetadata([
+      'p101',
+      'fcwd',
+      'n/Users/test/dev/alpha',
+      'ftxt',
+      'n/opt/homebrew/bin/node',
+      'ftxt',
+      'n/usr/lib/dyld',
+      'ftxt',
+      'n/Users/test/dev/alpha/node_modules/@next/swc-darwin-arm64/next-swc.darwin-arm64.node',
+      'pbad',
+      'fcwd',
+      'n/tmp/wrong-cwd',
+      'ftxt',
+      'n/tmp/wrong-executable',
+      'p202',
+      'ftxt',
+      'n/usr/bin/python3',
+      'fcwd',
+      'n/Users/test/dev/beta',
+      '',
+    ].join('\0\n'))).toEqual(new Map([
+      [101, {cwd: '/Users/test/dev/alpha', executable: '/opt/homebrew/bin/node'}],
+      [202, {cwd: '/Users/test/dev/beta', executable: '/usr/bin/python3'}],
+    ]));
+  });
+
+  it('preserves root and user UIDs from the ps process-group inventory', () => {
+    expect(parsePsProcessTable([
+      '    1     0     1     0',
+      '   99     1    99    -2',
+      '  501     1   500   501',
+      '',
+    ].join('\n'))).toEqual([
+      {pid: 1, ppid: 0, pgid: 1, uid: 0},
+      {pid: 99, ppid: 1, pgid: 99, uid: -2},
+      {pid: 501, ppid: 1, pgid: 500, uid: 501},
+    ]);
+  });
+
+  it.each([
+    '101 1 100',
+    '101 1 100 501 trailing',
+    '101 -1 100 501',
+    '0 0 1 0',
+    '101 1 0 501',
+    '9007199254740992 1 100 501',
+  ])('rejects a malformed ps process-group row: %s', (raw) => {
+    expect(() => parsePsProcessTable(raw)).toThrow();
+  });
+
   it('runs process and cwd discovery asynchronously and collapses aliases', async () => {
     const calls: string[] = [];
     const result = await collectListeners({
@@ -81,7 +135,7 @@ describe('lsof parsing and enrichment', () => {
           };
         }
         await Promise.resolve();
-        return {exitCode: 0, stdout: 'p101\nn/Users/test/dev/alpha\n'};
+        return {exitCode: 0, stdout: 'p101\nfcwd\nn/Users/test/dev/alpha\n'};
       },
       processProvider: async () => {
         await Promise.resolve();
@@ -107,6 +161,76 @@ describe('lsof parsing and enrichment', () => {
       kind: 'dev',
       projectName: 'alpha',
       elapsed: '00:02:00',
+    });
+  });
+
+  it('uses the first lsof text file when ps cannot resolve a titled Next executable', async () => {
+    const calls: string[] = [];
+    const startedAt = new Date('2026-08-27T00:00:00.000Z');
+    const result = await collectListeners({
+      home: '/Users/test',
+      now: new Date('2026-08-27T00:02:00.000Z'),
+      runCommand: async (_file, args) => {
+        calls.push(args.join(' '));
+        if (args.includes('-iTCP')) {
+          return {
+            exitCode: 0,
+            stdout: 'p101\ncnode\nn*:3000\np202\ncnode\nn*:3001\n',
+          };
+        }
+        return {
+          exitCode: 0,
+          stdout: [
+            'p101',
+            'fcwd',
+            'n/Users/test/dev/alpha',
+            'ftxt',
+            'n/opt/homebrew/bin/node',
+            'ftxt',
+            'n/usr/lib/dyld',
+            'ftxt',
+            'n/Users/test/dev/alpha/node_modules/@next/swc-darwin-arm64/next-swc.darwin-arm64.node',
+            'p202',
+            'fcwd',
+            'n/Users/test/dev/beta',
+            'ftxt',
+            'n/opt/homebrew/bin/node-from-lsof',
+            '',
+          ].join('\n'),
+        };
+      },
+      processProvider: async () => [
+        {
+          pid: 101,
+          ppid: 1,
+          uid: 501,
+          name: 'next-server (v15.1.4)',
+          command: 'next-server (v15.1.4)',
+          executable: '',
+          startTime: startedAt,
+        },
+        {
+          pid: 202,
+          ppid: 1,
+          uid: 501,
+          name: 'node',
+          command: 'node server.js',
+          executable: '/custom/node',
+          startTime: startedAt,
+        },
+      ],
+    });
+
+    expect(calls.some((call) => call.includes('-d cwd,txt') && call.includes('-F0fgpnu'))).toBe(true);
+    expect(result.find(({pid}) => pid === 101)).toMatchObject({
+      args: 'next-server (v15.1.4)',
+      cwd: '/Users/test/dev/alpha',
+      executable: '/opt/homebrew/bin/node',
+      uid: 501,
+      startTime: startedAt,
+    });
+    expect(result.find(({pid}) => pid === 202)).toMatchObject({
+      executable: '/custom/node',
     });
   });
 

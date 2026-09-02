@@ -6,7 +6,13 @@ import {openInBrowser} from '../browser.js';
 import {buildBrowserOptions, detectInstalledBrowsers, type BrowserOption} from '../browserCandidates.js';
 import type {ConfigRepository, GraveyardRecord, PortwardenConfig} from '../config.js';
 import {formatCommandForDisplay, redactCommandLine, sanitizeText} from '../core/commands.js';
-import {PortwardenActions, type ActionOutcome, type StopSignal} from '../core/actions.js';
+import {
+  listenerSharesStopScope,
+  listenerStopProcessGroup,
+  PortwardenActions,
+  type ActionOutcome,
+  type StopSignal,
+} from '../core/actions.js';
 import {listenerKey, listenerKeys, preferenceKey, selectionKey} from '../core/listeners.js';
 import type {ListenerEntry} from '../core/types.js';
 import {normalizeShortcut} from './keymap.js';
@@ -305,28 +311,40 @@ export function PortwardenApp({
       return;
     }
     if (selectedRow.type === 'listener') {
-      const pinnedForPid = scanner.allListeners.find((listener) =>
-        listener.pid === selectedRow.listener.pid && listenerIsPinned(listener, config.pinnedListenerKeys),
+      const pinnedForScope = scanner.allListeners.find((listener) =>
+        listenerSharesStopScope(selectedRow.listener, listener) &&
+        listenerIsPinned(listener, config.pinnedListenerKeys),
       );
-      if (pinnedForPid) {
-        setActionError(selectionKey(pinnedForPid) === selectionKey(selectedRow.listener)
+      if (pinnedForScope) {
+        const scope = pinnedForScope.pid === selectedRow.listener.pid
+          ? `PID ${selectedRow.listener.pid}`
+          : `Process group ${selectedRow.listener.pgid}`;
+        setActionError(selectionKey(pinnedForScope) === selectionKey(selectedRow.listener)
           ? `Port ${selectedRow.listener.port} is pinned. Unpin it before stopping.`
-          : `PID ${selectedRow.listener.pid} also owns pinned port ${pinnedForPid.port}. Unpin every listener for that PID before stopping it.`);
+          : `${scope} also owns pinned port ${pinnedForScope.port}. Unpin every listener in the stop scope before stopping it.`);
         return;
       }
     }
     const siblingPorts = selectedRow.type === 'listener'
       ? scanner.allListeners
         .filter((listener) =>
-          listener.pid === selectedRow.listener.pid && selectionKey(listener) !== selectionKey(selectedRow.listener),
+          listenerSharesStopScope(selectedRow.listener, listener) &&
+          selectionKey(listener) !== selectionKey(selectedRow.listener),
         )
         .map((listener) => `${listener.displayHost || listener.host}:${listener.port}`)
       : [];
-    const target = selectedRow.type === 'listener'
-      ? siblingPorts.length > 0
-        ? `port ${selectedRow.listener.port} (PID ${selectedRow.listener.pid}; also stops ${siblingPorts.join(', ')})`
-        : `port ${selectedRow.listener.port} (PID ${selectedRow.listener.pid}, ${selectedRow.listener.displayProject || selectedRow.listener.command})`
-      : `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})`;
+    let target: string;
+    if (selectedRow.type === 'listener') {
+      const pgid = listenerStopProcessGroup(selectedRow.listener);
+      const processIdentity = pgid === null
+        ? `PID ${selectedRow.listener.pid}`
+        : `PGID ${pgid}, PID ${selectedRow.listener.pid}`;
+      target = siblingPorts.length > 0
+        ? `port ${selectedRow.listener.port} (${processIdentity}; also stops ${siblingPorts.join(', ')})`
+        : `port ${selectedRow.listener.port} (${processIdentity}, ${selectedRow.listener.displayProject || selectedRow.listener.command})`;
+    } else {
+      target = `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})`;
+    }
     queueAction(
       signal === 'SIGKILL' ? `Force-stop ${target}?` : `Stop ${target}?`,
       signal === 'SIGKILL' ? 'SIGKILL does not allow cleanup.' : 'SIGTERM lets the process clean up first.',

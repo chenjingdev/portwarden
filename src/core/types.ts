@@ -23,6 +23,10 @@ export interface RawListener {
 export interface ListenerEntry {
   pid: number;
   ppid: number | null;
+  /** POSIX job-control group that owns this listener. */
+  pgid?: number;
+  /** Portwarden's own group at collection time, used to prevent self-termination. */
+  collectorPgid?: number;
   uid?: number;
   executable?: string;
   port: number;

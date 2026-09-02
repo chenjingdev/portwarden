@@ -7,7 +7,8 @@ import {render} from 'ink';
 import React from 'react';
 
 import {ConfigRepository} from './config.js';
-import {PortwardenActions, type StopSignal} from './core/actions.js';
+import {formatActionOutcomes, stopListenerMatches} from './cliActions.js';
+import {PortwardenActions, type ActionOutcome, type StopSignal} from './core/actions.js';
 import {collectListeners, selectListeners} from './core/listeners.js';
 import type {ListenerEntry, ZombieCandidate} from './core/types.js';
 import {collectProcesses, detectZombieCandidates, reapZombie} from './core/zombies.js';
@@ -50,8 +51,8 @@ const program = new Command()
   .addOption(new Option('-w, --watch [seconds]', 'refresh plain/JSON output continuously').argParser(parsePositiveNumber).default(false))
   .addOption(new Option('-b, --browser <name>', 'browser application used by the TUI').argParser(parseNonEmpty))
   .addOption(new Option('--next-port <port>', 'print the next actually available port').argParser(parsePort))
-  .addOption(new Option('--kill-port <port>', 'stop the current LISTEN process on a port').argParser(parsePort))
-  .addOption(new Option('--kill-pid <pid>', 'stop a current listener or detected zombie PID').argParser(parsePositiveInteger))
+  .addOption(new Option('--kill-port <port>', 'stop listeners on a port (including a verified dev process group)').argParser(parsePort))
+  .addOption(new Option('--kill-pid <pid>', 'stop a listener scope or detected zombie PID').argParser(parsePositiveInteger))
   .addHelpText('after', `
 Examples:
   $ portwarden
@@ -137,22 +138,16 @@ async function runDirectKill(actions: PortwardenActions, options: CliOptions): P
 
   if (options.killPort !== undefined) {
     const rawMatches = allListeners.filter(({port}) => port === options.killPort);
-    const matches = [...new Map(rawMatches.map((listener) => [listener.pid, listener])).values()];
-    if (matches.length === 0) {
+    if (rawMatches.length === 0) {
       throw new Error(`No LISTEN process is using port ${options.killPort}.`);
     }
-    await Promise.all(matches.map((listener) => actions.validateListener(listener)));
-    const outcomes = [];
-    for (const listener of matches) {
-      outcomes.push(await actions.stopListener(listener, signal));
-    }
-    console.log(outcomes.map(({message}) => message).join('\n'));
+    await stopListenerMatches(actions, rawMatches, signal, printActionOutcome);
     return;
   }
 
   const listener = allListeners.find(({pid}) => pid === options.killPid);
   if (listener) {
-    console.log((await actions.stopListener(listener, signal)).message);
+    printActionOutcome(await actions.stopListener(listener, signal));
     return;
   }
   const zombie = detectZombieCandidates(processes, {
@@ -160,10 +155,16 @@ async function runDirectKill(actions: PortwardenActions, options: CliOptions): P
     minAgeMs: 0,
   }).find(({pid}) => pid === options.killPid);
   if (zombie) {
-    console.log((await actions.stopZombie(zombie, signal)).message);
+    printActionOutcome(await actions.stopZombie(zombie, signal));
     return;
   }
   throw new Error(`PID ${options.killPid} is neither a current LISTEN process nor a detected automation zombie.`);
+}
+
+function printActionOutcome(outcome: ActionOutcome): void {
+  const formatted = formatActionOutcomes([outcome]);
+  if (formatted.stdout) console.log(formatted.stdout);
+  if (formatted.stderr) console.error(formatted.stderr);
 }
 
 async function runReap(options: CliOptions): Promise<void> {

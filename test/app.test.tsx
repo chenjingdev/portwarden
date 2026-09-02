@@ -252,6 +252,75 @@ describe('PortwardenApp', () => {
     expect(app.lastFrame()).not.toContain('enter/y confirm');
   });
 
+  it('includes listeners from another PID in the same process group in the stop confirmation', async () => {
+    const selected = listener({
+      pid: 101,
+      port: 3001,
+      displayProject: 'alpha',
+      pgid: 9_000,
+      collectorPgid: 8_000,
+    });
+    const groupSibling = listener({
+      pid: 102,
+      ppid: selected.pid,
+      port: 3002,
+      host: '0.0.0.0',
+      listenerHosts: ['0.0.0.0'],
+      displayHost: 'all',
+      displayProject: 'bravo',
+      args: 'node vite --port 3002',
+      pgid: selected.pgid,
+      collectorPgid: selected.collectorPgid,
+    });
+    scanner.listeners = [selected, groupSibling];
+    scanner.allListeners = [...scanner.listeners];
+    const repo = repository();
+    repo.update({confirmActions: true});
+    const app = render(<PortwardenApp configRepository={repo} />);
+    await update();
+
+    app.stdin.write('f');
+    await update();
+
+    expect(app.lastFrame()).toContain('Force-stop port 3001');
+    expect(app.lastFrame()).toContain('also stops all:3002');
+    expect(app.lastFrame()).toContain('enter/y confirm');
+  });
+
+  it('blocks a stop when another PID in the same process group owns a pinned listener', async () => {
+    const selected = listener({
+      pid: 101,
+      port: 3001,
+      displayProject: 'alpha',
+      pgid: 9_000,
+      collectorPgid: 8_000,
+    });
+    const pinnedGroupSibling = listener({
+      pid: 102,
+      ppid: selected.pid,
+      port: 3002,
+      displayProject: 'bravo',
+      args: 'node vite --port 3002',
+      pgid: selected.pgid,
+      collectorPgid: selected.collectorPgid,
+    });
+    scanner.listeners = [selected, pinnedGroupSibling];
+    scanner.allListeners = [...scanner.listeners];
+    const repo = repository();
+    repo.update({
+      confirmActions: true,
+      pinnedListenerKeys: [listenerKey(pinnedGroupSibling)],
+    });
+    const app = render(<PortwardenApp configRepository={repo} />);
+    await update();
+
+    app.stdin.write('x');
+    await update();
+
+    expect(app.lastFrame()).toContain('pinned port 3002');
+    expect(app.lastFrame()).not.toContain('enter/y confirm');
+  });
+
   it('clears stale action errors when queuing an action or refreshing manually', async () => {
     const repo = repository();
     repo.update({

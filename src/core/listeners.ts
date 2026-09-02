@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {homedir} from 'node:os';
+import process from 'node:process';
 
 import {execa} from 'execa';
 
@@ -106,7 +107,7 @@ const DEV_PORTS = new Set([
 
 const KIND_ORDER: Record<ListenerKind, number> = {dev: 0, app: 1, system: 2};
 const LSOF_LISTEN_ARGS = ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'] as const;
-const LSOF_CWD_CHUNK_SIZE = 200;
+const LSOF_PROCESS_CHUNK_SIZE = 200;
 
 export interface ListenerCommandRunner {
   (file: string, args: readonly string[], signal?: AbortSignal): Promise<CommandResult>;
@@ -129,6 +130,21 @@ export interface ListenerDetails {
   appFamily?: string;
   port?: number;
   home?: string;
+}
+
+export interface LsofProcessMetadata {
+  cwd?: string;
+  executable?: string;
+  pgid?: number;
+  uid?: number;
+}
+
+export interface ProcessGroupMember {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  uid?: number;
+  isCollectorAncestor?: boolean;
 }
 
 async function defaultCommandRunner(
@@ -163,6 +179,22 @@ async function runLsof(
     if (result.exitCode === 0) return result.stdout;
     if (isNoMatchesResult(result)) return '';
     if (options.strict) throw commandError('lsof', result);
+    return '';
+  } catch (error) {
+    if (options.strict) throw error;
+    return '';
+  }
+}
+
+async function runPs(
+  args: readonly string[],
+  options: Pick<CollectListenersOptions, 'runCommand' | 'signal' | 'strict'>,
+): Promise<string> {
+  const runner = options.runCommand ?? defaultCommandRunner;
+  try {
+    const result = await runner('ps', args, options.signal);
+    if (result.exitCode === 0) return result.stdout;
+    if (options.strict) throw commandError('ps', result);
     return '';
   } catch (error) {
     if (options.strict) throw error;
@@ -259,27 +291,122 @@ export function parseLsofCwds(raw: string): Map<number, string> {
   return cwds;
 }
 
-async function collectCwds(
+/** Parse the cwd and first program-text path reported for each process. */
+export function parseLsofProcessMetadata(raw: string): Map<number, LsofProcessMetadata> {
+  const metadata = new Map<number, LsofProcessMetadata>();
+  let pid: number | null = null;
+  let descriptor = '';
+  const fields = raw.includes('\0')
+    ? raw.split('\0').map((field) => field.replace(/^[\r\n]+/, ''))
+    : raw.split(/\r?\n/);
+
+  for (const line of fields) {
+    if (line.length < 2) continue;
+    if (line[0] === 'p') {
+      const parsedPid = Number.parseInt(line.slice(1), 10);
+      pid = Number.isSafeInteger(parsedPid) && parsedPid > 0 ? parsedPid : null;
+      descriptor = '';
+    } else if ((line[0] === 'g' || line[0] === 'u') && pid !== null) {
+      const parsedValue = Number.parseInt(line.slice(1), 10);
+      const minimum = line[0] === 'g' ? 1 : 0;
+      if (!Number.isSafeInteger(parsedValue) || parsedValue < minimum) continue;
+      const current = metadata.get(pid) ?? {};
+      if (line[0] === 'g') current.pgid = parsedValue;
+      else current.uid = parsedValue;
+      metadata.set(pid, current);
+    } else if (line[0] === 'f') {
+      descriptor = pid === null ? '' : line.slice(1);
+    } else if (line[0] === 'n' && pid !== null) {
+      const name = line.slice(1);
+      if (!name) continue;
+      const current = metadata.get(pid) ?? {};
+      if (descriptor === 'cwd') {
+        current.cwd = name;
+      } else if (descriptor === 'txt' && current.executable === undefined && path.isAbsolute(name)) {
+        current.executable = name;
+      } else {
+        continue;
+      }
+      metadata.set(pid, current);
+    }
+  }
+
+  return metadata;
+}
+
+async function collectProcessMetadata(
   pids: readonly number[],
   options: Pick<CollectListenersOptions, 'runCommand' | 'signal' | 'strict'>,
-): Promise<Map<number, string>> {
+): Promise<Map<number, LsofProcessMetadata>> {
   if (pids.length === 0) return new Map();
   const uniquePids = [...new Set(pids)].sort((left, right) => left - right);
   const chunks: number[][] = [];
-  for (let index = 0; index < uniquePids.length; index += LSOF_CWD_CHUNK_SIZE) {
-    chunks.push(uniquePids.slice(index, index + LSOF_CWD_CHUNK_SIZE));
+  for (let index = 0; index < uniquePids.length; index += LSOF_PROCESS_CHUNK_SIZE) {
+    chunks.push(uniquePids.slice(index, index + LSOF_PROCESS_CHUNK_SIZE));
   }
 
   const outputs = await Promise.all(
     chunks.map((chunk) =>
-      runLsof(['-a', '-d', 'cwd', '-p', chunk.join(','), '-Fn'], options),
+      runLsof(['-nP', '-a', '-d', 'cwd,txt', '-p', chunk.join(','), '-F0fgpnu'], options),
     ),
   );
-  const result = new Map<number, string>();
+  const result = new Map<number, LsofProcessMetadata>();
   for (const output of outputs) {
-    for (const [pid, cwd] of parseLsofCwds(output)) result.set(pid, cwd);
+    for (const [pid, processMetadata] of parseLsofProcessMetadata(output)) result.set(pid, processMetadata);
   }
   return result;
+}
+
+export async function collectProcessGroupMembers(
+  pgid: number,
+  options: Pick<CollectListenersOptions, 'runCommand' | 'signal' | 'strict'> = {},
+): Promise<ProcessGroupMember[]> {
+  if (!Number.isSafeInteger(pgid) || pgid <= 1) return [];
+  const processes = parsePsProcessTable(await runPs(
+    ['-axo', 'pid=,ppid=,pgid=,uid='],
+    options,
+  ));
+  const processByPid = new Map(processes.map((entry) => [entry.pid, entry]));
+  if (!processByPid.has(process.pid)) {
+    throw new Error(`ps did not return the Portwarden process ${process.pid}.`);
+  }
+  const collectorAncestors = new Set<number>();
+  let ancestor = processByPid.get(process.pid);
+  while (ancestor && !collectorAncestors.has(ancestor.pid)) {
+    collectorAncestors.add(ancestor.pid);
+    ancestor = processByPid.get(ancestor.ppid);
+  }
+  return processes
+    .filter((entry) => entry.pgid === pgid)
+    .map((entry) => ({
+      ...entry,
+      isCollectorAncestor: collectorAncestors.has(entry.pid),
+    }));
+}
+
+export function parsePsProcessTable(raw: string): ProcessGroupMember[] {
+  const processes: ProcessGroupMember[] = [];
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = /^(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)$/.exec(line);
+    if (!match) throw new Error('Could not parse the process-group inventory returned by ps.');
+    const [, pidText, ppidText, pgidText, uidText] = match;
+    const pid = Number(pidText);
+    const ppid = Number(ppidText);
+    const processGroupId = Number(pgidText);
+    const uid = Number(uidText);
+    if (
+      !Number.isSafeInteger(pid) || pid <= 0 ||
+      !Number.isSafeInteger(ppid) || ppid < 0 ||
+      !Number.isSafeInteger(processGroupId) || processGroupId <= 0 ||
+      !Number.isSafeInteger(uid)
+    ) {
+      throw new Error('ps returned invalid process-group identity data.');
+    }
+    processes.push({pid, ppid, pgid: processGroupId, uid});
+  }
+  return processes;
 }
 
 export async function collectListeners(options: CollectListenersOptions = {}): Promise<ListenerEntry[]> {
@@ -288,28 +415,41 @@ export async function collectListeners(options: CollectListenersOptions = {}): P
 
   const baseListeners = parseLsofListeners(raw);
   const pids = [...new Set(baseListeners.map(({pid}) => pid))];
+  const metadataPids = [...new Set([...pids, process.pid])];
   const processProvider = options.processProvider ?? collectProcesses;
 
-  const [processResult, cwdResult] = await Promise.allSettled([
+  const [processResult, metadataResult] = await Promise.allSettled([
     processProvider(),
-    collectCwds(pids, options),
+    collectProcessMetadata(metadataPids, options),
   ]);
   if (options.strict && processResult.status === 'rejected') throw processResult.reason;
-  if (options.strict && cwdResult.status === 'rejected') throw cwdResult.reason;
+  if (options.strict && metadataResult.status === 'rejected') throw metadataResult.reason;
 
   const processes = processResult.status === 'fulfilled' ? processResult.value : [];
-  const cwds = cwdResult.status === 'fulfilled' ? cwdResult.value : new Map<number, string>();
+  const processMetadata = metadataResult.status === 'fulfilled'
+    ? metadataResult.value
+    : new Map<number, LsofProcessMetadata>();
   const processByPid = new Map(processes.map((processInfo) => [processInfo.pid, processInfo]));
+  const collectorPgid = processMetadata.get(process.pid)?.pgid;
   const now = options.now ?? new Date();
 
   const enriched = baseListeners.flatMap((base) => {
     const endpoint = parseEndpoint(base.endpoint);
     if (!endpoint) return [];
+    const metadata = processMetadata.get(base.pid);
+    const processInfo = processByPid.get(base.pid);
+    const enrichedProcessInfo = processInfo && !processInfo.executable && metadata?.executable
+      ? {...processInfo, executable: metadata.executable}
+      : processInfo;
     return [
-      enrichListener(base, endpoint, processByPid.get(base.pid), cwds.get(base.pid), {
-        home: options.home,
-        now,
-      }),
+      {
+        ...enrichListener(base, endpoint, enrichedProcessInfo, metadata?.cwd, {
+          home: options.home,
+          now,
+        }),
+        ...(metadata?.pgid === undefined ? {} : {pgid: metadata.pgid}),
+        ...(collectorPgid === undefined ? {} : {collectorPgid}),
+      },
     ];
   });
 

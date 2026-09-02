@@ -17,6 +17,7 @@ import {
 import {
   canonicalHost,
   collectListeners,
+  collectProcessGroupMembers,
   listenerKey,
   listenerKeys,
   preferenceKey,
@@ -33,6 +34,7 @@ export interface ActionOutcome {
   listener?: ListenerEntry;
   port?: number;
   pid?: number;
+  pgid?: number;
   logPath?: string;
   graveyardSaved?: boolean;
 }
@@ -44,8 +46,29 @@ export interface ActionDependencies {
   getPort?: typeof getPort;
   launch?: typeof launchDetached;
   processProvider?: () => Promise<readonly ProcessInfo[]>;
+  collectProcessGroupMembers?: typeof collectProcessGroupMembers;
+  processGroupExists?: (pgid: number) => boolean;
   revalidateZombie?: typeof revalidateZombie;
   waitForZombieExit?: typeof waitForZombieExit;
+}
+
+export function listenerStopProcessGroup(entry: ListenerEntry): number | null {
+  if (process.platform === 'win32' || entry.kind !== 'dev') return null;
+  const {pgid, collectorPgid} = entry;
+  if (
+    !Number.isSafeInteger(pgid) || (pgid ?? 0) <= 1 ||
+    !Number.isSafeInteger(collectorPgid) || (collectorPgid ?? 0) <= 1 ||
+    pgid === collectorPgid
+  ) {
+    return null;
+  }
+  return pgid ?? null;
+}
+
+export function listenerSharesStopScope(target: ListenerEntry, candidate: ListenerEntry): boolean {
+  if (candidate.pid === target.pid) return true;
+  const pgid = listenerStopProcessGroup(target);
+  return pgid !== null && candidate.pgid === pgid;
 }
 
 export class ActionError extends Error {
@@ -73,6 +96,8 @@ export class PortwardenActions {
   private readonly findPort: typeof getPort;
   private readonly launch: typeof launchDetached;
   private readonly processProvider: () => Promise<readonly ProcessInfo[]>;
+  private readonly collectGroupMembers: typeof collectProcessGroupMembers;
+  private readonly processGroupExists: (pgid: number) => boolean;
   private readonly revalidateZombie: typeof revalidateZombie;
   private readonly waitForZombieExit: typeof waitForZombieExit;
 
@@ -86,13 +111,15 @@ export class PortwardenActions {
     this.findPort = dependencies.getPort ?? getPort;
     this.launch = dependencies.launch ?? launchDetached;
     this.processProvider = dependencies.processProvider ?? collectProcesses;
+    this.collectGroupMembers = dependencies.collectProcessGroupMembers ?? collectProcessGroupMembers;
+    this.processGroupExists = dependencies.processGroupExists ?? defaultProcessGroupExists;
     this.revalidateZombie = dependencies.revalidateZombie ?? revalidateZombie;
     this.waitForZombieExit = dependencies.waitForZombieExit ?? waitForZombieExit;
   }
 
   /** Revalidate a listener without changing process or config state. */
-  async validateListener(entry: ListenerEntry): Promise<ListenerEntry> {
-    const {current, listeners} = await this.requireCurrentListenerSnapshot(entry);
+  async validateListener(entry: ListenerEntry, signal: StopSignal = 'SIGTERM'): Promise<ListenerEntry> {
+    const {current, listeners} = await this.requireCurrentListenerSnapshot(entry, signal === 'SIGKILL');
     this.assertStoppableListener(current, listeners);
     return current;
   }
@@ -100,11 +127,14 @@ export class PortwardenActions {
   private assertStoppableListener(current: ListenerEntry, listeners: readonly ListenerEntry[]): void {
     const config = this.configRepository.get();
     const pinnedSibling = listeners.find((listener) =>
-      listener.pid === current.pid && isPinned(listener, config),
+      listenerSharesStopScope(current, listener) && isPinned(listener, config),
     );
     if (pinnedSibling) {
+      const scope = pinnedSibling.pid === current.pid
+        ? `PID ${current.pid}`
+        : `Process group ${current.pgid}`;
       throw new ActionError(
-        `PID ${current.pid} also owns pinned port ${pinnedSibling.port}. Unpin every listener for that PID before stopping it.`,
+        `${scope} also owns pinned port ${pinnedSibling.port}. Unpin every listener in the stop scope before stopping it.`,
         'PINNED',
       );
     }
@@ -116,17 +146,25 @@ export class PortwardenActions {
       throw new ActionError(`Port ${entry.port} is pinned. Unpin it before stopping.`, 'PINNED');
     }
 
-    const {current, listeners} = await this.requireCurrentListenerSnapshot(entry);
+    const {current, listeners} = await this.requireCurrentListenerSnapshot(entry, signal === 'SIGKILL');
     this.assertStoppableListener(current, listeners);
     const graveyardRecord = current.kind === 'dev' ? captureGraveyardRecord(current, this.now()) : null;
+    const stopTarget = await this.resolveListenerStopTarget(current);
     try {
-      this.kill(current.pid, signal);
+      this.kill(stopTarget.killPid, signal);
     } catch (error) {
       const message = sanitizeText(error instanceof Error ? error.message : String(error));
-      throw new ActionError(`Could not signal PID ${current.pid}: ${message}`, 'STOP_FAILED');
+      const scope = stopTarget.pgid === undefined ? `PID ${current.pid}` : `process group ${stopTarget.pgid}`;
+      throw new ActionError(`Could not signal ${scope}: ${message}`, 'STOP_FAILED');
     }
-    const stopped = await waitForListenerGone(current, this.collect, signal === 'SIGKILL' ? 2_000 : 4_000);
-    if (!stopped) {
+    const timeoutMs = signal === 'SIGKILL' ? 2_000 : 4_000;
+    const groupStopped = stopTarget.pgid === undefined
+      ? true
+      : await waitForProcessGroupGone(stopTarget.pgid, this.processGroupExists, timeoutMs);
+    const listenerStopped = stopTarget.pgid === undefined
+      ? await waitForListenerGone(current, this.collect, timeoutMs)
+      : groupStopped || await waitForListenerGone(current, this.collect, 0);
+    if (!listenerStopped) {
       throw new ActionError(`PID ${current.pid} is still listening on port ${current.port}.`, 'STOP_FAILED');
     }
 
@@ -151,13 +189,79 @@ export class PortwardenActions {
         : graveyardSaveError
           ? ''
         : ' No revive record was saved because the command cannot be replayed safely.';
+    const confirmedPgid = stopTarget.pgid !== undefined && groupStopped ? stopTarget.pgid : undefined;
+    const groupMessage = confirmedPgid === undefined
+      ? ''
+      : ` and its ${stopTarget.memberCount}-process group ${confirmedPgid}`;
+    const warnings = [
+      stopTarget.warning,
+      stopTarget.pgid !== undefined && !groupStopped
+        ? `Port ${current.port} stopped, but process group ${stopTarget.pgid} still has running members.`
+        : '',
+      graveyardSaveError ? `Revive record was not saved: ${graveyardSaveError}.` : '',
+    ].filter(Boolean).join(' ');
     return {
-      message: `Stopped ${current.displayProject || current.command} on port ${current.port} (${signal}).${graveyardMessage}`,
-      warning: graveyardSaveError ? `Revive record was not saved: ${graveyardSaveError}.` : undefined,
+      message: `Stopped ${current.displayProject || current.command} on port ${current.port}${groupMessage} (${signal}).${graveyardMessage}`,
+      warning: warnings || undefined,
       port: current.port,
       pid: current.pid,
+      ...(confirmedPgid === undefined ? {} : {pgid: confirmedPgid}),
       graveyardSaved: current.kind === 'dev' ? graveyardSaved : undefined,
     };
+  }
+
+  private async resolveListenerStopTarget(current: ListenerEntry): Promise<{
+    killPid: number;
+    pgid?: number;
+    memberCount?: number;
+    warning?: string;
+  }> {
+    const pgid = listenerStopProcessGroup(current);
+    if (pgid === null) {
+      const warning = current.pgid !== undefined && current.pgid === current.collectorPgid
+        ? `Process group ${current.pgid} is shared with Portwarden; stopped only PID ${current.pid}.`
+        : undefined;
+      return {killPid: current.pid, warning};
+    }
+
+    let members;
+    try {
+      members = await this.collectGroupMembers(pgid, {strict: true});
+    } catch (error) {
+      const message = sanitizeText(error instanceof Error ? error.message : String(error));
+      return {
+        killPid: current.pid,
+        warning: `Could not verify process group ${pgid}; stopped only PID ${current.pid}: ${message}.`,
+      };
+    }
+
+    if (members.length === 0) {
+      return {
+        killPid: current.pid,
+        warning: `Process group ${pgid} could not be inventoried; stopped only PID ${current.pid}.`,
+      };
+    }
+    const targetMember = members.find(({pid}) => pid === current.pid);
+    if (!targetMember || targetMember.uid !== current.uid) {
+      throw new ActionError(`Process group ${pgid} changed; refresh before acting.`, 'STALE_PROCESS');
+    }
+    if (members.some(({isCollectorAncestor}) => isCollectorAncestor)) {
+      return {
+        killPid: current.pid,
+        warning: `Process group ${pgid} contains Portwarden's parent session; stopped only PID ${current.pid}.`,
+      };
+    }
+    const effectiveUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    if (
+      typeof effectiveUid !== 'number' ||
+      members.some(({uid}) => uid !== effectiveUid)
+    ) {
+      return {
+        killPid: current.pid,
+        warning: `Process group ${pgid} contains an unverified owner; stopped only PID ${current.pid}.`,
+      };
+    }
+    return {killPid: -pgid, pgid, memberCount: members.length};
   }
 
   async stopZombie(candidate: ZombieCandidate, signal: StopSignal): Promise<ActionOutcome> {
@@ -357,13 +461,14 @@ export class PortwardenActions {
     }
   }
 
-  private async requireCurrentListenerSnapshot(expected: ListenerEntry): Promise<{
+  private async requireCurrentListenerSnapshot(expected: ListenerEntry, allowMissingExecutable = false): Promise<{
     current: ListenerEntry;
     listeners: ListenerEntry[];
   }> {
     const effectiveUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
     if (
-      expected.pid <= 1 || !expected.args || !expected.cwd || !expected.startTime || !expected.executable ||
+      expected.pid <= 1 || !expected.args || !expected.cwd || !expected.startTime ||
+      (!allowMissingExecutable && !expected.executable) ||
       (typeof effectiveUid === 'number' && expected.uid !== effectiveUid)
     ) {
       throw new ActionError(`PID ${expected.pid} has insufficient identity data for a destructive action.`, 'STALE_PROCESS');
@@ -519,14 +624,39 @@ function declaresDifferentPort(snapshot: CommandSnapshot, expectedPort: number):
 
 async function waitForListenerGone(entry: ListenerEntry, collect: typeof collectListeners, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  while (true) {
     const listeners = await collect({strict: true});
     if (!listeners.some(({pid, port}) => pid === entry.pid && port === entry.port)) {
       return true;
     }
+    if (Date.now() >= deadline) return false;
     await delay(150);
   }
-  return false;
+}
+
+function defaultProcessGroupExists(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return !(
+      typeof error === 'object' && error !== null &&
+      'code' in error && error.code === 'ESRCH'
+    );
+  }
+}
+
+async function waitForProcessGroupGone(
+  pgid: number,
+  exists: (pgid: number) => boolean,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!exists(pgid)) return true;
+    await delay(100);
+  }
+  return !exists(pgid);
 }
 
 async function rollbackLaunchedProcess(
@@ -636,6 +766,7 @@ function terminateLaunchedProcessGroup(pid: number | undefined, signal: StopSign
 
 function sameListenerIdentity(current: ListenerEntry, expected: ListenerEntry): boolean {
   return current.pid === expected.pid &&
+    current.pgid === expected.pgid &&
     current.port === expected.port &&
     canonicalHost(current.host) === canonicalHost(expected.host) &&
     current.startTime?.getTime() === expected.startTime?.getTime() &&
