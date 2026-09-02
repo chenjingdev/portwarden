@@ -74,7 +74,11 @@ describe('ConfigRepository', () => {
 
 describe('resolveConfigPaths', () => {
   it('retains the existing macOS Application Support location', () => {
-    expect(resolveConfigPaths({homeDirectory: '/Users/test', platform: 'darwin'}).current).toBe(
+    expect(resolveConfigPaths({
+      homeDirectory: '/Users/test',
+      platform: 'darwin',
+      xdgConfigHome: '',
+    }).current).toBe(
       '/Users/test/Library/Application Support/portwarden/config.json',
     );
   });
