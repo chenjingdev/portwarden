@@ -33,6 +33,12 @@ const BROWSER_KEYWORDS = [
   'duckduckgo',
 ] as const;
 
+const NON_BROWSER_KEYWORDS = [
+  'installer',
+  'uninstall',
+  'updater',
+] as const;
+
 export interface ApplicationDirectoryEntry {
   name: string;
   isDirectory(): boolean;
@@ -90,7 +96,9 @@ export function detectInstalledBrowsers(options: BrowserDetectionOptions = {}): 
 
         const appName = normalizeBrowserName(entry.name.replace(/\.app$/i, ''));
         const lowerName = appName.toLowerCase();
-        if (appName && BROWSER_KEYWORDS.some((keyword) => lowerName.includes(keyword))) {
+        const looksLikeBrowser = BROWSER_KEYWORDS.some((keyword) => lowerName.includes(keyword));
+        const looksLikeMaintenanceTool = NON_BROWSER_KEYWORDS.some((keyword) => lowerName.includes(keyword));
+        if (appName && looksLikeBrowser && !looksLikeMaintenanceTool) {
           candidates.add(appName);
         }
       } catch {

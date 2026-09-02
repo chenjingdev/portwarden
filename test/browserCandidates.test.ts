@@ -17,6 +17,7 @@ describe('detectInstalledBrowsers', () => {
       if (directory === '/Applications') {
         return [
           entry('Google Chrome.app'),
+          entry('Chrome Remote Desktop Host Uninstaller.app'),
           entry('Firefox Nightly.app'),
           entry('DuckDuckGo.app'),
           entry('Not A Browser.app'),
