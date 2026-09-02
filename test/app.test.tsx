@@ -193,9 +193,11 @@ describe('PortwardenApp', () => {
     const app = render(<PortwardenApp configRepository={repo} />);
     await update();
     app.stdin.write('g');
+    await waitForFrame(app, 'GRAVEYARD');
+    // Ink can paint the new screen before its input handler effect is rebound.
     await update();
     app.stdin.write('r');
-    await update();
+    await waitForFrame(app, 'Revive port 3001 (alpha)?');
 
     expect(app.lastFrame()).toContain('enter/y confirm  esc/n cancel');
     expect(app.lastFrame()).toContain('Revive port 3001 (alpha)?');
@@ -521,6 +523,19 @@ function listener(overrides: Partial<ListenerEntry>): ListenerEntry {
 
 async function update(): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, 30));
+}
+
+async function waitForFrame(
+  app: ReturnType<typeof render>,
+  expected: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((app.lastFrame() ?? '').includes(expected)) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for frame containing: ${expected}`);
 }
 
 function deferred<T>(): {promise: Promise<T>; resolve: (value: T) => void} {
