@@ -202,8 +202,10 @@ describe('PortwardenApp', () => {
     expect(app.lastFrame()).toContain('enter/y confirm  esc/n cancel');
     expect(app.lastFrame()).toContain('Revive port 3001 (alpha)?');
 
-    app.stdin.write('n');
+    // Likewise, wait for the confirmation input handler before cancelling it.
     await update();
+    app.stdin.write('n');
+    await waitForFrameWithout(app, 'Revive port 3001 (alpha)?');
     expect(app.lastFrame()).not.toContain('Revive port 3001 (alpha)?');
     expect(app.lastFrame()).toContain('GRAVEYARD');
   });
@@ -536,6 +538,19 @@ async function waitForFrame(
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Timed out waiting for frame containing: ${expected}`);
+}
+
+async function waitForFrameWithout(
+  app: ReturnType<typeof render>,
+  unexpected: string,
+  timeoutMs = 1_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!(app.lastFrame() ?? '').includes(unexpected)) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for frame to remove: ${unexpected}`);
 }
 
 function deferred<T>(): {promise: Promise<T>; resolve: (value: T) => void} {
