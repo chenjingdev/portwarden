@@ -60,7 +60,7 @@ describe('legacy main-screen UI contract', () => {
 
     const lines = frameLines(app);
     const metaIndex = lines.findIndex((line) => /^refresh \d{2}:\d{2}:\d{2}  browser system  selected 1\/3$/.test(line));
-    const portsIndex = lines.findIndex((line) => /^PORTS  showing 1-3 of 3$/.test(line));
+    const portsIndex = lines.findIndex((line) => /^PORTS \+ DEV BROWSERS  showing 1-3 of 3$/.test(line));
     const tableHeaderIndex = lines.findIndex((line) => /\bPIN\b.*\bPORT\b.*\bPID\b.*\bAGE\b.*\bHOST\b.*\bPROJECT\b.*\bPROCESS\b/.test(line));
     const selectedRowIndex = lines.findIndex((line) => /^> .*\b3001\b.*\balpha\b/.test(line));
     const detailsIndex = lines.findIndex((line) => /^DETAILS  alpha$/.test(line));
@@ -77,7 +77,7 @@ describe('legacy main-screen UI contract', () => {
     expect.soft(lines[detailsIndex + 1]).toMatch(/^-+$/);
     expect.soft(lines.slice(detailsIndex + 2, detailsIndex + 7)).toEqual([
       'port 3001  pid 101  kind DEV  age 00:01:00  pin NO',
-      'next 3004  dup none  host localhost',
+      'stop scope PID 101, ports 3001  next 3004  dup none',
       'proj alpha',
       'dir  /tmp/project',
       'cmd  node vite',
@@ -131,10 +131,13 @@ describe('legacy main-screen UI contract', () => {
 
     app.stdin.write('\u001B[C');
     await update();
+    await vi.waitFor(() => expect(app.lastFrame()).toContain('state expanded'));
     app.stdin.write('\u001B[B');
     await update();
+    await vi.waitFor(() => expect(frameLines(app)).toContain('DETAILS  helper-one'));
     app.stdin.write('\u001B[B');
     await update();
+    await vi.waitFor(() => expect(frameLines(app)).toContain('DETAILS  helper-two'));
     const expandedLines = frameLines(app);
     const childDetailsIndex = expandedLines.findIndex((line) => line === 'DETAILS  helper-two');
     expect(childDetailsIndex).toBeGreaterThan(-1);

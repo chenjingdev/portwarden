@@ -11,6 +11,7 @@ const BROWSER_EXECUTABLES = new Set([
   'chromium',
   'chromium-browser',
   'google chrome',
+  'google chrome for testing',
   'google-chrome',
   'google-chrome-stable',
   'headless_shell',
@@ -42,6 +43,7 @@ export interface DetectZombieOptions {
 
 export interface CollectProcessesOptions {
   provider?: () => Promise<readonly ProcessDescriptor[]>;
+  memoryProvider?: () => Promise<ReadonlyMap<number, number>>;
   now?: Date | number;
 }
 
@@ -83,12 +85,36 @@ export interface WaitForZombieExitOptions {
 
 export async function collectProcesses(options: CollectProcessesOptions = {}): Promise<ProcessInfo[]> {
   const provider = options.provider ?? (() => psList({all: true}));
-  const descriptors = await provider();
+  const [descriptors, memory] = await Promise.all([
+    provider(),
+    options.memoryProvider ? options.memoryProvider() : options.provider ? Promise.resolve(new Map<number, number>()) : collectResidentMemory(),
+  ]);
   const now = toTimestamp(options.now ?? Date.now());
   return descriptors
     .filter(({pid}) => Number.isSafeInteger(pid) && pid > 0)
-    .map((descriptor) => processFromDescriptor(descriptor, now))
+    .map((descriptor) => ({...processFromDescriptor(descriptor, now), ...(memory.has(descriptor.pid) ? {rssBytes: memory.get(descriptor.pid)} : {})}))
     .sort((left, right) => left.pid - right.pid);
+}
+
+export function parseResidentMemory(raw: string): Map<number, number> {
+  const result = new Map<number, number>();
+  for (const line of raw.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const bytes = Number(match[2]) * 1024;
+    if (pid > 0 && Number.isSafeInteger(pid) && Number.isSafeInteger(bytes)) result.set(pid, bytes);
+  }
+  return result;
+}
+
+async function collectResidentMemory(): Promise<Map<number, number>> {
+  try {
+    const result = await execa('ps', ['-axo', 'pid=,rss='], {reject: false});
+    return result.exitCode === 0 ? parseResidentMemory(result.stdout) : new Map();
+  } catch {
+    return new Map();
+  }
 }
 
 export function processFromDescriptor(descriptor: ProcessDescriptor, now = Date.now()): ProcessInfo {

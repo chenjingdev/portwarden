@@ -3,28 +3,21 @@ import type {ListenerEntry} from './core/types.js';
 
 type ListenerStopActions = Pick<PortwardenActions, 'validateListener' | 'stopListener'>;
 
-/**
- * Stop each distinct listener, skipping later PIDs only after a verified group
- * stop. A PID-only fallback intentionally leaves the remaining PIDs in the
- * worklist.
- */
+/** Stop each displayed task (or standalone PID) once. */
 export async function stopListenerMatches(
   actions: ListenerStopActions,
   rawMatches: readonly ListenerEntry[],
   signal: StopSignal,
   onOutcome?: (outcome: ActionOutcome) => void,
 ): Promise<ActionOutcome[]> {
-  const matches = [...new Map(rawMatches.map((listener) => [listener.pid, listener])).values()];
+  const matches = [...new Map(rawMatches.map((listener) => [listener.task?.key ?? `pid:${listener.pid}`, listener])).values()];
   await Promise.all(matches.map((listener) => actions.validateListener(listener, signal)));
 
   const outcomes: ActionOutcome[] = [];
-  const stoppedGroups = new Set<number>();
   for (const listener of matches) {
-    if (listener.pgid !== undefined && stoppedGroups.has(listener.pgid)) continue;
     const outcome = await actions.stopListener(listener, signal);
     outcomes.push(outcome);
     onOutcome?.(outcome);
-    if (outcome.pgid !== undefined) stoppedGroups.add(outcome.pgid);
   }
   return outcomes;
 }

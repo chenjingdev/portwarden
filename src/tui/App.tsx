@@ -8,13 +8,13 @@ import type {ConfigRepository, GraveyardRecord, PortwardenConfig} from '../confi
 import {formatCommandForDisplay, redactCommandLine, sanitizeText} from '../core/commands.js';
 import {
   listenerSharesStopScope,
-  listenerStopProcessGroup,
   PortwardenActions,
   type ActionOutcome,
   type StopSignal,
 } from '../core/actions.js';
 import {listenerKey, listenerKeys, preferenceKey, selectionKey} from '../core/listeners.js';
 import type {ListenerEntry} from '../core/types.js';
+import {formatMemory} from '../core/browserSessions.js';
 import {normalizeShortcut} from './keymap.js';
 import {buildVisibleRows, listenerIsPinned, type VisibleRow} from './rows.js';
 import {useScanner} from './useScanner.js';
@@ -24,7 +24,7 @@ type Screen = 'main' | 'settings' | 'browser' | 'graveyard' | 'help';
 interface Confirmation {
   title: string;
   detail: string;
-  action: () => Promise<void>;
+  action: () => Promise<unknown>;
 }
 
 export interface PortwardenAppProps {
@@ -63,6 +63,7 @@ export function PortwardenApp({
   const [status, setStatus] = useState('');
   const [actionError, setActionError] = useState('');
   const [actionWarning, setActionWarning] = useState('');
+  const actionInFlight = useRef(false);
   const [busy, setBusy] = useState('');
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const selectionIndexHint = useRef(0);
@@ -88,8 +89,10 @@ export function PortwardenApp({
       expandedGroups,
       pinnedListenerKeys: config.pinnedListenerKeys,
       query,
+      browsers: scanner.browsers,
+      allListeners: scanner.allListeners,
     }),
-    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies],
+    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies, scanner.browsers, scanner.allListeners],
   );
   const selectedIndex = selectedKey ? visibleRows.findIndex(({key}) => key === selectedKey) : -1;
   const effectiveSelectedIndex = visibleRows.length === 0
@@ -151,6 +154,8 @@ export function PortwardenApp({
   };
 
   const runAction = async (label: string, action: () => Promise<ActionOutcome | string>) => {
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
     setBusy(label);
     setActionError('');
     setActionWarning('');
@@ -187,11 +192,13 @@ export function PortwardenApp({
         // The original action error still explains why manual verification is needed.
       }
     } finally {
+      actionInFlight.current = false;
       setBusy('');
     }
   };
 
-  const queueAction = (title: string, detail: string, action: () => Promise<void>) => {
+  const queueAction = (title: string, detail: string, action: () => Promise<unknown>) => {
+    if (actionInFlight.current) return;
     setActionError('');
     setActionWarning('');
     if (config.confirmActions) {
@@ -202,6 +209,7 @@ export function PortwardenApp({
   };
 
   const moveMainSelection = (delta: number) => {
+    setActionError('');
     if (visibleRows.length === 0) return;
     pendingSelectionKey.current = null;
     const next = clamp(effectiveSelectedIndex + delta, 0, visibleRows.length - 1);
@@ -212,7 +220,7 @@ export function PortwardenApp({
   const toggleSelectedPin = () => {
     pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
-      setActionError(selectedRow?.type === 'group' ? 'Expand the app group and select one listener to pin it.' : 'Only LISTEN ports can be pinned.');
+      setActionError((selectedRow?.type === 'group' || selectedRow?.type === 'process') ? 'Expand the app group and select one listener to pin it.' : 'Only LISTEN ports can be pinned.');
       return;
     }
     const aliases = new Set(listenerKeys(selectedRow.listener));
@@ -246,7 +254,7 @@ export function PortwardenApp({
   const reorderSelected = (direction: -1 | 1) => {
     pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
-      if (selectedRow?.type === 'group') toggleGroup(selectedRow, direction > 0);
+      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, direction > 0);
       return;
     }
     const selectedPinned = listenerIsPinned(selectedRow.listener, config.pinnedListenerKeys);
@@ -281,7 +289,7 @@ export function PortwardenApp({
     );
   };
 
-  const toggleGroup = (row: Extract<VisibleRow, {type: 'group'}>, force?: boolean) => {
+  const toggleGroup = (row: Extract<VisibleRow, {type: 'group' | 'process'}>, force?: boolean) => {
     pendingSelectionKey.current = null;
     setExpandedGroups((current) => {
       const next = new Set(current);
@@ -294,8 +302,8 @@ export function PortwardenApp({
 
   const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener'}>): boolean => {
     if (!row.parentGroupKey) return false;
-    const parent = visibleRows.find((candidate): candidate is Extract<VisibleRow, {type: 'group'}> =>
-      candidate.type === 'group' && candidate.key === row.parentGroupKey,
+    const parent = visibleRows.find((candidate): candidate is Extract<VisibleRow, {type: 'group' | 'process'}> =>
+      (candidate.type === 'group' || candidate.type === 'process') && candidate.key === row.parentGroupKey,
     );
     if (!parent) return false;
     setSelectedKey(parent.key);
@@ -310,48 +318,36 @@ export function PortwardenApp({
       setActionError(selectedRow ? 'Expand the group and select one process first.' : 'No process selected.');
       return;
     }
-    if (selectedRow.type === 'listener') {
-      const pinnedForScope = scanner.allListeners.find((listener) =>
-        listenerSharesStopScope(selectedRow.listener, listener) &&
-        listenerIsPinned(listener, config.pinnedListenerKeys),
-      );
-      if (pinnedForScope) {
-        const scope = pinnedForScope.pid === selectedRow.listener.pid
-          ? `PID ${selectedRow.listener.pid}`
-          : `Process group ${selectedRow.listener.pgid}`;
-        setActionError(selectionKey(pinnedForScope) === selectionKey(selectedRow.listener)
-          ? `Port ${selectedRow.listener.port} is pinned. Unpin it before stopping.`
-          : `${scope} also owns pinned port ${pinnedForScope.port}. Unpin every listener in the stop scope before stopping it.`);
+    const listener = selectedRow.type === 'listener' ? selectedRow.listener
+      : selectedRow.type === 'process' ? selectedRow.members[0] : undefined;
+    if (listener) {
+      const pinned = scanner.allListeners.find((entry) =>
+        listenerSharesStopScope(listener, entry) && listenerIsPinned(entry, config.pinnedListenerKeys));
+      if (pinned) {
+        setActionError(selectedRow.type === 'listener' && selectionKey(pinned) === selectionKey(listener)
+          ? `Port ${listener.port} is pinned. Unpin it before stopping.`
+          : `${listener.task ? `Task ${listener.task.root.pid}` : `PID ${listener.pid}`} also owns pinned port ${pinned.port}. Unpin every listener in the stop scope before stopping it.`);
         return;
       }
     }
-    const siblingPorts = selectedRow.type === 'listener'
-      ? scanner.allListeners
-        .filter((listener) =>
-          listenerSharesStopScope(selectedRow.listener, listener) &&
-          selectionKey(listener) !== selectionKey(selectedRow.listener),
-        )
-        .map((listener) => `${listener.displayHost || listener.host}:${listener.port}`)
-      : [];
-    let target: string;
-    if (selectedRow.type === 'listener') {
-      const pgid = listenerStopProcessGroup(selectedRow.listener);
-      const processIdentity = pgid === null
-        ? `PID ${selectedRow.listener.pid}`
-        : `PGID ${pgid}, PID ${selectedRow.listener.pid}`;
-      target = siblingPorts.length > 0
-        ? `port ${selectedRow.listener.port} (${processIdentity}; also stops ${siblingPorts.join(', ')})`
-        : `port ${selectedRow.listener.port} (${processIdentity}, ${selectedRow.listener.displayProject || selectedRow.listener.command})`;
-    } else {
-      target = `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})`;
-    }
+    const siblingPorts = listener ? scanner.allListeners.filter((entry) =>
+      entry.pid === listener.pid && selectionKey(entry) !== selectionKey(listener)) : [];
+    const target = listener
+      ? listener.task
+        ? `task ${listener.task.root.pid} (${listener.task.members.length} processes; ports ${listener.task.ports.join(', ')})`
+      : siblingPorts.length > 0
+        ? `PID ${listener.pid}, ports ${[listener, ...siblingPorts].map(({port}) => port).join(', ')}`
+        : `port ${listener.port} (PID ${listener.pid}, ${listener.displayProject || listener.command})`
+      : selectedRow.type === 'browser'
+        ? `browser PID ${selectedRow.browser.pid} (${selectedRow.browser.members.length} processes, ${formatMemory(selectedRow.browser.memoryBytes)} RSS)`
+        : selectedRow.type === 'zombie' ? `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})` : '';
     queueAction(
       signal === 'SIGKILL' ? `Force-stop ${target}?` : `Stop ${target}?`,
       signal === 'SIGKILL' ? 'SIGKILL does not allow cleanup.' : 'SIGTERM lets the process clean up first.',
       async () => runAction(signal === 'SIGKILL' ? 'Force-stopping…' : 'Stopping…', () =>
-        selectedRow.type === 'listener'
-          ? actions.stopListener(selectedRow.listener, signal)
-          : actions.stopZombie(selectedRow.zombie, signal),
+          listener ? actions.stopListener(listener, signal)
+            : selectedRow.type === 'browser' ? actions.stopBrowser(selectedRow.browser, signal)
+              : selectedRow.type === 'zombie' ? actions.stopZombie(selectedRow.zombie, signal) : Promise.resolve('No process selected.'),
       ),
     );
   };
@@ -423,14 +419,14 @@ export function PortwardenApp({
   useInput((input, key) => {
     const normalized = normalizeShortcut(input, key);
     if (key.ctrl && normalized === 'c') {
-      if (!busy) exit();
+      if (!actionInFlight.current) exit();
       return;
     }
     if (key.ctrl && normalized === 'l') {
       writeStdout('\u001B[2J\u001B[3J\u001B[H');
       return;
     }
-    if (busy) return;
+    if (actionInFlight.current) return;
 
     if (confirmation) {
       if (key.return || normalized === 'y') {
@@ -446,6 +442,9 @@ export function PortwardenApp({
     if (filterMode) {
       if (key.return) {
         pendingSelectionKey.current = null;
+        selectionIndexHint.current = 0;
+        setSelectedKey(null);
+        setActionError('');
         setQuery(filterDraft.trim());
         setFilterMode(false);
         setStatus(filterDraft.trim() ? `Filter: ${filterDraft.trim()}` : 'Filter cleared.');
@@ -509,12 +508,12 @@ export function PortwardenApp({
     } else if (key.downArrow) {
       moveMainSelection(1);
     } else if (key.leftArrow) {
-      if (selectedRow?.type === 'group') toggleGroup(selectedRow, false);
+      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, false);
       else if (selectedRow?.type !== 'listener' || !collapseParentGroup(selectedRow)) reorderSelected(-1);
     } else if (key.rightArrow) {
-      if (selectedRow?.type === 'group') toggleGroup(selectedRow, true);
+      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, true);
       else reorderSelected(1);
-    } else if (key.return && selectedRow?.type === 'group') {
+    } else if (key.return && (selectedRow?.type === 'group' || selectedRow?.type === 'process')) {
       toggleGroup(selectedRow);
     } else if (key.return && selectedRow?.type === 'listener' && selectedRow.parentGroupKey) {
       collapseParentGroup(selectedRow);
@@ -619,6 +618,8 @@ export function PortwardenApp({
         rowCount={visibleRows.length}
         hiddenCount={all ? 0 : Math.max(0, scanner.allListeners.length - scanner.listeners.length)}
         zombieCount={scanner.zombies.length}
+        browserCount={scanner.browsers?.length ?? 0}
+        browserMemory={scanner.browsers?.every(({memoryBytes}) => memoryBytes !== null) ? scanner.browsers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null}
         selectedIndex={effectiveSelectedIndex}
         browser={normalizedBrowserOverride || config.browser}
         loading={scanner.loading}
@@ -658,6 +659,8 @@ function MainHeader(props: {
   rowCount: number;
   hiddenCount: number;
   zombieCount: number;
+  browserCount: number;
+  browserMemory: number | null;
   selectedIndex: number;
   browser: string;
   loading: boolean;
@@ -671,6 +674,7 @@ function MainHeader(props: {
       <Text bold color="cyan" wrap="truncate-end">
         PORTWARDEN  <Text color={props.all ? 'cyan' : 'green'}>[{props.all ? 'ALL' : 'MAIN'}]</Text>{' '}
         <Text color="white">[{props.listenerCount} port{props.listenerCount === 1 ? '' : 's'}]</Text>{' '}
+        {props.browserCount > 0 ? <Text color="magenta">[{props.browserCount} browsers · {formatMemory(props.browserMemory)} RSS] </Text> : null}
         {props.all && props.rowCount !== props.listenerCount ? <Text color="gray">[{props.rowCount} rows] </Text> : null}
         {!props.all && props.hiddenCount > 0 ? <Text color="yellow">[hidden {props.hiddenCount}] </Text> : null}
         {props.showZombies ? <Text color={props.zombieCount ? 'red' : 'gray'}>[{props.zombieCount} zombies]</Text> : null}
@@ -702,11 +706,11 @@ function MainTable(props: {
   const fillerCount = Math.max(0, props.pageSize - Math.max(1, visible.length));
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Text><Text bold>PORTS</Text>  <Text dimColor>{showing}</Text></Text>
-      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
+      <Text><Text bold>PORTS + DEV BROWSERS</Text>  <Text dimColor>{showing}</Text></Text>
+      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST / RAM', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
       <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
       {visible.length === 0 ? (
-        <Text color="yellow">  {props.all ? 'No LISTEN ports found.' : 'No relevant or pinned ports found.'}</Text>
+        <Text color="yellow">  {props.all ? 'No LISTEN ports or dev browsers found.' : 'No relevant ports or dev browsers found.'}</Text>
       ) : visible.map((row, localIndex) => (
         <DataRow
           key={row.key}
@@ -729,6 +733,16 @@ function DataRow({row, selected, widths, config, columns}: {
   config: PortwardenConfig;
   columns: number;
 }) {
+  if (row.type === 'process') {
+    const listener = row.members[0]!;
+    const task = listener.task;
+    const ports = [...new Set(row.members.map(({port}) => port))];
+    return <TableRow
+      values={[task ? 'TASK' : 'PID', row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, String(task?.root.pid ?? listener.pid), listener.elapsed,
+        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
+      widths={widths} columns={columns} selected={selected} color="cyan"
+    />;
+  }
   if (row.type === 'group') {
     const hosts = [...new Set(row.members.map(({displayHost}) => displayHost))].join(', ');
     return (
@@ -760,6 +774,14 @@ function DataRow({row, selected, widths, config, columns}: {
         color="red"
       />
     );
+  }
+  if (row.type === 'browser') {
+    const browser = row.browser;
+    return <TableRow
+      values={['BROWSER', '-', '-', String(browser.pid), formatSeconds(browser.ageSeconds), formatMemory(browser.memoryBytes), browser.family,
+        `${formatMemory(browser.memoryBytes)} · ${browser.members.length} procs · ${browser.name}`]}
+      widths={widths} columns={columns} selected={selected} color="magenta"
+    />;
   }
   const pinned = listenerIsPinned(row.listener, config.pinnedListenerKeys);
   return (
@@ -805,13 +827,13 @@ function Details({row, config, columns, listeners}: {
   listeners: readonly ListenerEntry[];
 }) {
   const lines = detailLines(row, config, listeners);
-  const label = row?.type === 'group'
+  const label = (row?.type === 'group' || row?.type === 'process')
     ? row.family
     : row?.type === 'listener'
       ? row.listener.displayProject || '-'
       : row?.type === 'zombie'
         ? row.zombie.family
-        : '';
+        : row?.type === 'browser' ? row.browser.family : '';
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end"><Text bold>DETAILS</Text>{label ? <>  <Text dimColor>{sanitizeText(label)}</Text></> : null}</Text>
@@ -828,7 +850,37 @@ function detailLines(
   config: PortwardenConfig,
   listeners: readonly ListenerEntry[],
 ): [string, string, string, string, string] {
-  if (!row) return ['No port selected.', '', '', '', ''];
+  if (!row) return ['No process selected.', '', '', '', ''];
+  if (row.type === 'process') {
+    const listener = row.members[0]!;
+    const task = listener.task;
+    if (task) return [
+      `task ${task.root.pid}  ${task.members.length} processes  RAM ${formatMemory(task.memoryBytes)} RSS sum  ports ${task.ports.join(', ')}`,
+      `stops PIDs ${task.members.map(({pid}) => pid).join(', ')}  including launcher + workers`,
+      task.blockedReason || `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire task protected' : 'NO'}  dir ${sanitizeText(task.root.cwd)}`,
+      `cmd ${redactCommandLine(task.root.command)}`,
+      'hint enter expand/collapse ports  x stop whole task  f force-stop',
+    ];
+    return [
+      `pid ${listener.pid}  ${row.members.length} listeners share one process  age ${listener.elapsed}`,
+      `stopping this PID closes ALL ports: ${[...new Set(row.members.map(({port}) => port))].join(', ')}`,
+      `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire PID protected' : 'NO'}  dir ${sanitizeText(listener.displayCwd)}`,
+      `cmd ${redactCommandLine(listener.args)}`,
+      'hint enter expand/collapse  x stop entire PID  f force-stop  expand to pin/open a port',
+    ];
+  }
+  if (row.type === 'browser') {
+    const browser = row.browser;
+    const pids = new Set(browser.members.map(({pid}) => pid));
+    const ports = [...new Set(listeners.filter(({pid}) => pids.has(pid)).map(({port}) => port))];
+    return [
+      `pid ${browser.pid}  RAM ${formatMemory(browser.memoryBytes)} RSS sum  processes ${browser.members.length}  age ${formatSeconds(browser.ageSeconds)}`,
+      `parent ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState}; activity unknown)  ports ${ports.join(', ') || 'none'}`,
+      `profile ${sanitizeText(browser.profile) || '-'}  reason ${browser.reason}`,
+      `proc ${redactCommandLine(browser.command)}`,
+      'hint x stop browser + helpers  f force-stop',
+    ];
+  }
   if (row.type === 'group') {
     const ports = [...new Set(row.members.map(({port}) => port))];
     const hosts = [...new Set(row.members.map(({displayHost}) => displayHost))].filter(Boolean);
@@ -854,7 +906,9 @@ function detailLines(
   const duplicateCount = listeners.filter(({port}) => port === row.listener.port).length;
   return [
     `port ${row.listener.port}  pid ${row.listener.pid}  kind ${row.listener.kind.toUpperCase()}  age ${row.listener.elapsed}  pin ${pinned ? 'YES' : 'NO'}`,
-    `next ${nextAvailablePort(listeners, row.listener.port)}  dup ${duplicateCount > 1 ? `${duplicateCount} in use` : 'none'}  host ${row.listener.displayHost || row.listener.host}`,
+    row.listener.task
+      ? `stop scope TASK ${row.listener.task.root.pid}, ${row.listener.task.members.length} processes, ports ${row.listener.task.ports.join(', ')}`
+      : `stop scope PID ${row.listener.pid}, ports ${[...new Set(listeners.filter(({pid}) => pid === row.listener.pid).map(({port}) => port))].join(', ')}  next ${nextAvailablePort(listeners, row.listener.port)}  dup ${duplicateCount > 1 ? `${duplicateCount} in use` : 'none'}`,
     `proj ${row.listener.displayProject || '-'}`,
     `dir  ${sanitizeText(row.listener.displayCwd || row.listener.cwd) || '-'}`,
     `cmd  ${redactCommandLine(row.listener.displayCommand || row.listener.args) || '-'}`,
@@ -879,7 +933,11 @@ function ConfirmationBox({confirmation}: {confirmation: Confirmation}) {
 }
 
 function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number}) {
-  const shortcuts = row?.type === 'group'
+  const shortcuts = row?.type === 'browser'
+    ? 'x stop browser + helpers  f force-stop  a all/main  / filter  r refresh  ? help  q quit'
+    : row?.type === 'process'
+      ? 'enter expand/collapse  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
+    : row?.type === 'group'
     ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
     : row?.type === 'listener' && row.parentGroupKey
       ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'

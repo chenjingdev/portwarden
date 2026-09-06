@@ -12,6 +12,20 @@ export interface ProcessInfo {
   startTime?: Date;
   ageMs?: number | null;
   cwd?: string;
+  /** Resident memory in bytes; absent when the OS could not report it. */
+  rssBytes?: number;
+}
+
+export interface BrowserSession extends ProcessInfo {
+  family: ZombieFamily | 'chrome-automation';
+  profile: string;
+  parentName: string;
+  parentState: 'running' | 'missing';
+  ageSeconds: number | null;
+  members: ProcessInfo[];
+  /** Sum of member RSS, not a prediction of memory freed on exit. */
+  memoryBytes: number | null;
+  reason: string;
 }
 
 export interface RawListener {
@@ -20,7 +34,19 @@ export interface RawListener {
   endpoint: string;
 }
 
+/** One observed development launch and its descendants, never a whole PGID. */
+export interface ProcessTask {
+  key: string;
+  root: ProcessInfo;
+  members: ProcessInfo[];
+  ports: number[];
+  label: string;
+  memoryBytes: number | null;
+  blockedReason?: string;
+}
+
 export interface ListenerEntry {
+  task?: ProcessTask;
   pid: number;
   ppid: number | null;
   /** POSIX job-control group that owns this listener. */

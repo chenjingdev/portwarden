@@ -17,13 +17,15 @@ import {
 import {
   canonicalHost,
   collectListeners,
-  collectProcessGroupMembers,
+  collectProcessMetadata,
   listenerKey,
   listenerKeys,
   preferenceKey,
   selectionKey,
 } from './listeners.js';
-import type {ListenerEntry, ProcessInfo, ZombieCandidate} from './types.js';
+import type {BrowserSession, ListenerEntry, ProcessInfo, ProcessTask, ZombieCandidate} from './types.js';
+import {sameTaskSnapshot} from './processTasks.js';
+import {detectBrowserSessions, sameBrowserProcess} from './browserSessions.js';
 import {collectProcesses, revalidateZombie, waitForZombieExit} from './zombies.js';
 
 export type StopSignal = 'SIGTERM' | 'SIGKILL';
@@ -46,29 +48,15 @@ export interface ActionDependencies {
   getPort?: typeof getPort;
   launch?: typeof launchDetached;
   processProvider?: () => Promise<readonly ProcessInfo[]>;
-  collectProcessGroupMembers?: typeof collectProcessGroupMembers;
-  processGroupExists?: (pgid: number) => boolean;
+  collectProcessMetadata?: typeof collectProcessMetadata;
   revalidateZombie?: typeof revalidateZombie;
   waitForZombieExit?: typeof waitForZombieExit;
 }
 
-export function listenerStopProcessGroup(entry: ListenerEntry): number | null {
-  if (process.platform === 'win32' || entry.kind !== 'dev') return null;
-  const {pgid, collectorPgid} = entry;
-  if (
-    !Number.isSafeInteger(pgid) || (pgid ?? 0) <= 1 ||
-    !Number.isSafeInteger(collectorPgid) || (collectorPgid ?? 0) <= 1 ||
-    pgid === collectorPgid
-  ) {
-    return null;
-  }
-  return pgid ?? null;
-}
-
+/** Match the observed task tree, falling back to one PID for standalone apps.
+ * A shared POSIX process group is not sufficient evidence of a shared task. */
 export function listenerSharesStopScope(target: ListenerEntry, candidate: ListenerEntry): boolean {
-  if (candidate.pid === target.pid) return true;
-  const pgid = listenerStopProcessGroup(target);
-  return pgid !== null && candidate.pgid === pgid;
+  return target.task ? target.task.members.some(({pid}) => pid === candidate.pid) : candidate.pid === target.pid;
 }
 
 export class ActionError extends Error {
@@ -96,8 +84,7 @@ export class PortwardenActions {
   private readonly findPort: typeof getPort;
   private readonly launch: typeof launchDetached;
   private readonly processProvider: () => Promise<readonly ProcessInfo[]>;
-  private readonly collectGroupMembers: typeof collectProcessGroupMembers;
-  private readonly processGroupExists: (pgid: number) => boolean;
+  private readonly processMetadataProvider: typeof collectProcessMetadata;
   private readonly revalidateZombie: typeof revalidateZombie;
   private readonly waitForZombieExit: typeof waitForZombieExit;
 
@@ -111,8 +98,7 @@ export class PortwardenActions {
     this.findPort = dependencies.getPort ?? getPort;
     this.launch = dependencies.launch ?? launchDetached;
     this.processProvider = dependencies.processProvider ?? collectProcesses;
-    this.collectGroupMembers = dependencies.collectProcessGroupMembers ?? collectProcessGroupMembers;
-    this.processGroupExists = dependencies.processGroupExists ?? defaultProcessGroupExists;
+    this.processMetadataProvider = dependencies.collectProcessMetadata ?? collectProcessMetadata;
     this.revalidateZombie = dependencies.revalidateZombie ?? revalidateZombie;
     this.waitForZombieExit = dependencies.waitForZombieExit ?? waitForZombieExit;
   }
@@ -125,16 +111,14 @@ export class PortwardenActions {
   }
 
   private assertStoppableListener(current: ListenerEntry, listeners: readonly ListenerEntry[]): void {
+    if (current.task?.blockedReason) throw new ActionError(current.task.blockedReason, 'STALE_PROCESS');
     const config = this.configRepository.get();
     const pinnedSibling = listeners.find((listener) =>
       listenerSharesStopScope(current, listener) && isPinned(listener, config),
     );
     if (pinnedSibling) {
-      const scope = pinnedSibling.pid === current.pid
-        ? `PID ${current.pid}`
-        : `Process group ${current.pgid}`;
       throw new ActionError(
-        `${scope} also owns pinned port ${pinnedSibling.port}. Unpin every listener in the stop scope before stopping it.`,
+        `${current.task ? `Task ${current.task.root.pid}` : `PID ${current.pid}`} also owns pinned port ${pinnedSibling.port}. Unpin every listener in the stop scope before stopping it.`,
         'PINNED',
       );
     }
@@ -148,24 +132,22 @@ export class PortwardenActions {
 
     const {current, listeners} = await this.requireCurrentListenerSnapshot(entry, signal === 'SIGKILL');
     this.assertStoppableListener(current, listeners);
-    const graveyardRecord = current.kind === 'dev' ? captureGraveyardRecord(current, this.now()) : null;
-    const stopTarget = await this.resolveListenerStopTarget(current);
-    try {
-      this.kill(stopTarget.killPid, signal);
-    } catch (error) {
-      const message = sanitizeText(error instanceof Error ? error.message : String(error));
-      const scope = stopTarget.pgid === undefined ? `PID ${current.pid}` : `process group ${stopTarget.pgid}`;
-      throw new ActionError(`Could not signal ${scope}: ${message}`, 'STOP_FAILED');
-    }
-    const timeoutMs = signal === 'SIGKILL' ? 2_000 : 4_000;
-    const groupStopped = stopTarget.pgid === undefined
-      ? true
-      : await waitForProcessGroupGone(stopTarget.pgid, this.processGroupExists, timeoutMs);
-    const listenerStopped = stopTarget.pgid === undefined
-      ? await waitForListenerGone(current, this.collect, timeoutMs)
-      : groupStopped || await waitForListenerGone(current, this.collect, 0);
-    if (!listenerStopped) {
-      throw new ActionError(`PID ${current.pid} is still listening on port ${current.port}.`, 'STOP_FAILED');
+    const task = current.task;
+    const graveyardSource = task ? {...current, args: task.root.command, cwd: task.root.cwd ?? current.cwd, startTime: task.root.startTime} : current;
+    const graveyardRecord = current.kind === 'dev' ? captureGraveyardRecord(graveyardSource, this.now()) : null;
+    if (task) {
+      await this.stopProcessTask(current, task, signal);
+    } else {
+      try {
+        this.kill(current.pid, signal);
+      } catch (error) {
+        const message = sanitizeText(error instanceof Error ? error.message : String(error));
+        throw new ActionError(`Could not signal PID ${current.pid}: ${message}`, 'STOP_FAILED');
+      }
+      const listenerStopped = await waitForListenerGone(current, this.collect, signal === 'SIGKILL' ? 2_000 : 4_000);
+      if (!listenerStopped) {
+        throw new ActionError(`PID ${current.pid} still has listening ports. Refresh before retrying.`, 'STOP_FAILED');
+      }
     }
 
     let graveyardSaved = false;
@@ -189,79 +171,147 @@ export class PortwardenActions {
         : graveyardSaveError
           ? ''
         : ' No revive record was saved because the command cannot be replayed safely.';
-    const confirmedPgid = stopTarget.pgid !== undefined && groupStopped ? stopTarget.pgid : undefined;
-    const groupMessage = confirmedPgid === undefined
-      ? ''
-      : ` and its ${stopTarget.memberCount}-process group ${confirmedPgid}`;
-    const warnings = [
-      stopTarget.warning,
-      stopTarget.pgid !== undefined && !groupStopped
-        ? `Port ${current.port} stopped, but process group ${stopTarget.pgid} still has running members.`
-        : '',
-      graveyardSaveError ? `Revive record was not saved: ${graveyardSaveError}.` : '',
-    ].filter(Boolean).join(' ');
+    const ports = task?.ports ?? [...new Set(listeners.filter(({pid}) => pid === current.pid).map(({port}) => port))];
+    const warnings = graveyardSaveError ? `Revive record was not saved: ${graveyardSaveError}.` : '';
     return {
-      message: `Stopped ${current.displayProject || current.command} on port ${current.port}${groupMessage} (${signal}).${graveyardMessage}`,
+      message: `Stopped ${current.displayProject || current.command} on port ${ports.join(', ')} (${task ? `task ${task.root.pid}, ${task.members.length} processes` : `PID ${current.pid}`}) (${signal}).${graveyardMessage}`,
       warning: warnings || undefined,
       port: current.port,
       pid: current.pid,
-      ...(confirmedPgid === undefined ? {} : {pgid: confirmedPgid}),
       graveyardSaved: current.kind === 'dev' ? graveyardSaved : undefined,
     };
   }
 
-  private async resolveListenerStopTarget(current: ListenerEntry): Promise<{
-    killPid: number;
-    pgid?: number;
-    memberCount?: number;
-    warning?: string;
-  }> {
-    const pgid = listenerStopProcessGroup(current);
-    if (pgid === null) {
-      const warning = current.pgid !== undefined && current.pgid === current.collectorPgid
-        ? `Process group ${current.pgid} is shared with Portwarden; stopped only PID ${current.pid}.`
-        : undefined;
-      return {killPid: current.pid, warning};
+  private async stopProcessTask(listener: ListenerEntry, task: ProcessTask, signal: StopSignal): Promise<void> {
+    const fresh = await this.requireCurrentListenerSnapshot(listener);
+    this.assertStoppableListener(fresh.current, fresh.listeners);
+    if (!fresh.current.task || !sameTaskSnapshot(fresh.current.task, task) ||
+      task.members.some((entry) => !sameBrowserProcess(entry, entry))) {
+      throw new ActionError('The task changed or contains an unverifiable process. Refresh before stopping.', 'STALE_PROCESS');
     }
-
-    let members;
+    const signaled: number[] = [];
     try {
-      members = await this.collectGroupMembers(pgid, {strict: true});
+      for (const member of task.members) {
+        let current = (await this.processProvider()).find(({pid}) => pid === member.pid);
+        if (!current) continue;
+        if (!current.executable || (member.cwd && !current.cwd)) {
+          const metadata = (await this.processMetadataProvider([member.pid], {strict: true})).get(member.pid);
+          if (metadata?.uid === current.uid) current = {
+            ...current, executable: current.executable || metadata?.executable || '', cwd: current.cwd || metadata?.cwd,
+          };
+        }
+        if (!sameBrowserProcess(current, member) || (member.cwd && current.cwd !== member.cwd)) {
+          if (member.pid === task.root.pid) throw new Error('Task root identity changed before its signal.');
+          continue;
+        }
+        try {
+          this.kill(member.pid, signal);
+          signaled.push(member.pid);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+      }
+      const expected = new Map(task.members.map((entry) => [entry.pid, entry]));
+      const deadline = Date.now() + (signal === 'SIGKILL' ? 2_000 : 4_000);
+      do {
+        const [processes, listeners] = await Promise.all([this.processProvider(), this.collect({strict: true})]);
+        const remaining = processes.filter((entry) => {
+          const previous = expected.get(entry.pid);
+          return previous && (!entry.startTime || entry.startTime.getTime() === previous.startTime?.getTime());
+        });
+        if (!remaining.length && !listeners.some(({pid}) => expected.has(pid))) return;
+        if (Date.now() >= deadline) throw new Error('Some task processes or ports remain; refresh and retry or force-stop.');
+        await delay(100);
+      } while (true);
     } catch (error) {
-      const message = sanitizeText(error instanceof Error ? error.message : String(error));
-      return {
-        killPid: current.pid,
-        warning: `Could not verify process group ${pgid}; stopped only PID ${current.pid}: ${message}.`,
-      };
+      throw new ActionError(`Task cleanup: ${signaled.length} processes signaled. ${sanitizeText(error instanceof Error ? error.message : error)}`, 'STOP_FAILED');
     }
+  }
 
-    if (members.length === 0) {
-      return {
-        killPid: current.pid,
-        warning: `Process group ${pgid} could not be inventoried; stopped only PID ${current.pid}.`,
-      };
+  async stopBrowser(candidate: BrowserSession, signal: StopSignal): Promise<ActionOutcome> {
+    const browserProcesses = async (): Promise<readonly ProcessInfo[]> => {
+      const processes = await this.processProvider();
+      const tree = detectBrowserSessions(processes).find(({pid}) => pid === candidate.pid);
+      const targetPids = new Set([...candidate.members, ...(tree?.members ?? [])].map(({pid}) => pid));
+      const missing = processes.filter((entry) => targetPids.has(entry.pid) && !entry.executable);
+      if (missing.length === 0) return processes;
+      // ps-list may lose Chrome Helper paths containing many spaces, or paths
+      // from a previous Chrome version. Resolve those from OS program-text data
+      // on every snapshot, including immediately before each helper's signal.
+      const metadata = await this.processMetadataProvider(missing.map(({pid}) => pid), {strict: true});
+      return processes.map((entry) => {
+        const details = metadata.get(entry.pid);
+        return !entry.executable && details?.executable && details.uid === entry.uid
+          ? {...entry, executable: details.executable}
+          : entry;
+      });
+    };
+    const processes = await browserProcesses();
+    const current = detectBrowserSessions(processes).find(({pid}) => pid === candidate.pid);
+    if (!current || !sameBrowserProcess(current, candidate) || current.ppid !== candidate.ppid) {
+      throw new ActionError(`Browser PID ${candidate.pid} changed; refresh before stopping.`, 'STALE_PROCESS');
     }
-    const targetMember = members.find(({pid}) => pid === current.pid);
-    if (!targetMember || targetMember.uid !== current.uid) {
-      throw new ActionError(`Process group ${pgid} changed; refresh before acting.`, 'STALE_PROCESS');
+    const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
+    const ancestors = new Set<number>();
+    let ancestor: number | undefined = process.pid;
+    while (ancestor && !ancestors.has(ancestor)) {
+      ancestors.add(ancestor);
+      ancestor = byPid.get(ancestor)?.ppid;
     }
-    if (members.some(({isCollectorAncestor}) => isCollectorAncestor)) {
-      return {
-        killPid: current.pid,
-        warning: `Process group ${pgid} contains Portwarden's parent session; stopped only PID ${current.pid}.`,
-      };
+    if (current.members.some((member) => ancestors.has(member.pid))) {
+      throw new ActionError('Browser tree includes Portwarden; nothing was killed.', 'STALE_PROCESS');
     }
-    const effectiveUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
-    if (
-      typeof effectiveUid !== 'number' ||
-      members.some(({uid}) => uid !== effectiveUid)
-    ) {
-      return {
-        killPid: current.pid,
-        warning: `Process group ${pgid} contains an unverified owner; stopped only PID ${current.pid}.`,
-      };
+    const unverifiable = current.members.find((member) => !sameBrowserProcess(member, member));
+    if (unverifiable) {
+      throw new ActionError(`Browser helper PID ${unverifiable.pid} has incomplete identity data; nothing was killed.`, 'STALE_PROCESS');
     }
-    return {killPid: -pgid, pgid, memberCount: members.length};
+    const members = new Map(current.members.map((entry) => [entry.pid, entry]));
+    const listeners = await this.collect({strict: true});
+    const pinned = new Set(this.configRepository.get().pinnedListenerKeys);
+    const protectedListener = listeners.find((entry) => members.has(entry.pid) && listenerKeys(entry).some((key) => pinned.has(key)));
+    if (protectedListener) {
+      throw new ActionError(`Browser owns pinned port ${protectedListener.port}. Unpin it before stopping.`, 'PINNED');
+    }
+    // Recheck membership after lsof and before the first signal. Newly discovered
+    // children need a fresh pin check, so a changing tree is retried by the user.
+    const verified = detectBrowserSessions(await browserProcesses()).find(({pid}) => pid === current.pid);
+    if (!verified || verified.ppid !== current.ppid || verified.members.length !== members.size ||
+      verified.members.some((entry) => !members.has(entry.pid) || !sameBrowserProcess(entry, members.get(entry.pid)!))) {
+      throw new ActionError('Browser tree changed; refresh before stopping. Nothing was killed.', 'STALE_PROCESS');
+    }
+    const signaled: number[] = [];
+    try {
+      // Stop the browser first to prevent it from spawning replacement helpers.
+      // Never signal its controller or an OS process group shared with other jobs.
+      for (const member of verified.members) {
+        const fresh = (await browserProcesses()).find(({pid}) => pid === member.pid);
+        if (!fresh) continue;
+        if (!sameBrowserProcess(fresh, member)) {
+          if (member.pid === current.pid) throw new Error('Browser identity changed before its signal.');
+          continue; // Exited/reused child PID: never signal its replacement.
+        }
+        try {
+          this.kill(member.pid, signal);
+          signaled.push(member.pid);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+      }
+      const deadline = Date.now() + (signal === 'SIGKILL' ? 1_000 : 3_000);
+      do {
+        const remaining = (await this.processProvider()).filter((entry) => {
+          const expected = members.get(entry.pid);
+          return expected && (!entry.startTime || entry.startTime.getTime() === expected.startTime?.getTime());
+        });
+        if (remaining.length === 0) {
+          return {message: `Stopped browser PID ${candidate.pid} and its helpers (${members.size} processes, ${signal}).`, pid: candidate.pid};
+        }
+        if (Date.now() >= deadline) throw new Error(`${remaining.length} browser process(es) still running or unverifiable; refresh and use force-stop if needed.`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (true);
+    } catch (error) {
+      throw new ActionError(`Browser cleanup: ${signaled.length} process(es) signaled. ${sanitizeText(error instanceof Error ? error.message : error)}`, 'STOP_FAILED');
+    }
   }
 
   async stopZombie(candidate: ZombieCandidate, signal: StopSignal): Promise<ActionOutcome> {
@@ -447,6 +497,7 @@ export class PortwardenActions {
   }
 
   private assertMovableListener(current: ListenerEntry, listeners: readonly ListenerEntry[]): void {
+    if (current.task) throw new ActionError('Port move is unavailable for grouped tasks. Restart the task with its new port.', 'UNSUPPORTED_MOVE');
     const config = this.configRepository.get();
     const pinnedSibling = listeners.find((listener) =>
       listener.pid === current.pid &&
@@ -477,6 +528,10 @@ export class PortwardenActions {
     const current = listeners.find((entry) => sameListenerIdentity(entry, expected));
     if (!current) {
       throw new ActionError(`PID ${expected.pid} changed or stopped; refresh before acting.`, 'STALE_PROCESS');
+    }
+    if (Boolean(current.task) !== Boolean(expected.task) ||
+      (current.task && expected.task && !sameTaskSnapshot(current.task, expected.task))) {
+      throw new ActionError('The task process/port scope changed. Refresh before stopping; nothing was killed.', 'STALE_PROCESS');
     }
     return {current, listeners};
   }
@@ -583,12 +638,16 @@ async function waitForMatchingListener(options: WaitForMatchingOptions): Promise
         continue;
       }
       const expectedCwd = options.cwd ?? options.original?.cwd ?? '';
-      if (!expectedCwd || entry.cwd !== expectedCwd || !entry.args || !entry.startTime) continue;
+      if (!expectedCwd || !entry.args || !entry.startTime) continue;
       const currentSnapshot = parseCommandSnapshot(entry.args);
+      const rootSnapshot = entry.task ? parseCommandSnapshot(entry.task.root.command) : null;
       const commandMatches = Boolean(
-        currentSnapshot &&
+        (entry.cwd === expectedCwd && currentSnapshot &&
           !declaresDifferentPort(currentSnapshot, options.port) &&
-          normalizeCommandForComparison(currentSnapshot) === normalizeCommandForComparison(options.expected),
+          normalizeCommandForComparison(currentSnapshot) === normalizeCommandForComparison(options.expected)) ||
+        (entry.task?.root.cwd === expectedCwd && rootSnapshot &&
+          !declaresDifferentPort(rootSnapshot, options.port) &&
+          normalizeCommandForComparison(rootSnapshot) === normalizeCommandForComparison(options.expected)),
       );
       if (commandMatches && await belongsToLaunch(entry.pid, options.launchedPid, options.processProvider)) {
         return entry;
@@ -626,39 +685,13 @@ async function waitForListenerGone(entry: ListenerEntry, collect: typeof collect
   const deadline = Date.now() + timeoutMs;
   while (true) {
     const listeners = await collect({strict: true});
-    if (!listeners.some(({pid, port}) => pid === entry.pid && port === entry.port)) {
+    if (!listeners.some(({pid}) => pid === entry.pid)) {
       return true;
     }
     if (Date.now() >= deadline) return false;
     await delay(150);
   }
 }
-
-function defaultProcessGroupExists(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch (error) {
-    return !(
-      typeof error === 'object' && error !== null &&
-      'code' in error && error.code === 'ESRCH'
-    );
-  }
-}
-
-async function waitForProcessGroupGone(
-  pgid: number,
-  exists: (pgid: number) => boolean,
-  timeoutMs: number,
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!exists(pgid)) return true;
-    await delay(100);
-  }
-  return !exists(pgid);
-}
-
 async function rollbackLaunchedProcess(
   pid: number | undefined,
   started: ListenerEntry | undefined,

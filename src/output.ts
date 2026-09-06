@@ -1,7 +1,8 @@
 import Table from 'cli-table3';
 
 import {redactCommandLine, sanitizeText} from './core/commands.js';
-import type {ListenerEntry, ZombieCandidate} from './core/types.js';
+import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
+import {formatMemory} from './core/browserSessions.js';
 
 export interface OutputOptions {
   all: boolean;
@@ -10,6 +11,7 @@ export interface OutputOptions {
   showZombies?: boolean;
   terminalWidth?: number;
   watchSeconds?: number;
+  allListeners?: readonly ListenerEntry[];
 }
 
 export interface ReapResult {
@@ -22,16 +24,29 @@ export function renderOutput(
   allListenerCount: number,
   zombies: readonly ZombieCandidate[],
   options: OutputOptions,
+  browsers: readonly BrowserSession[] = [],
 ): string {
+  const tasks = new Map((options.allListeners ?? listeners).flatMap(({task}) => task ? [[task.key, task] as const] : []));
+  const taskPids = new Set([...tasks.values()].flatMap(({members}) => members.map(({pid}) => pid)));
+  browsers = browsers.filter(({pid}) => !taskPids.has(pid));
+  const browserPids = new Set(browsers.flatMap(({members}) => members.map(({pid}) => pid)));
+  const scopePorts = (pid: number) => [...new Set((options.allListeners ?? listeners).filter((entry) => entry.pid === pid).map(({port}) => port))];
+  zombies = zombies.filter(({pid}) => !browserPids.has(pid) && !taskPids.has(pid));
   if (options.json) {
     const entries = [
-      ...listeners.map(listenerToJson),
+      ...listeners.map((entry) => ({...listenerToJson(entry), stopScope: entry.task ? {
+        type: 'task', rootPid: entry.task.root.pid, ports: entry.task.ports,
+        memberPids: entry.task.members.map(({pid}) => pid), processCount: entry.task.members.length,
+        command: redactCommandLine(entry.task.root.command), memoryBytes: entry.task.memoryBytes,
+        blockedReason: entry.task.blockedReason,
+      } : {pid: entry.pid, ports: scopePorts(entry.pid)}})),
       ...zombies.map(zombieToJson),
+      ...browsers.map(browserToJson),
     ];
     return options.jsonLines ? JSON.stringify(entries) : JSON.stringify(entries, null, 2);
   }
 
-  const shown = listeners.length + zombies.length;
+  const shown = listeners.length + zombies.length + browsers.length;
   const hidden = Math.max(0, allListenerCount - listeners.length);
   const lines = [
     `${options.all ? 'All LISTEN ports' : 'Relevant + pinned ports'}: ${listeners.length}${zombies.length ? ` · zombies: ${zombies.length}` : ''}`,
@@ -85,15 +100,16 @@ export function renderOutput(
     },
   });
 
-  for (const entry of listeners) {
+  for (const entry of new Map(listeners.filter(({pid}) => !browserPids.has(pid)).map((entry) => [entry.task?.key ?? `pid:${entry.pid}`, entry])).values()) {
+    const ports = entry.task?.ports ?? scopePorts(entry.pid);
     const fullRow = [
-      entry.kind,
-      String(entry.port),
-      String(entry.pid),
+      entry.task ? 'task' : entry.kind,
+      ports.length > 1 ? `${ports.length}x` : String(entry.port),
+      String(entry.task?.root.pid ?? entry.pid),
       entry.elapsed,
       entry.displayHost,
       sanitizeText(entry.displayProject) || '-',
-      redactCommandLine(entry.args || entry.displayCommand),
+      `${entry.task ? `${entry.task.members.length} procs · ` : ''}${ports.length > 1 ? `ports ${ports.join(', ')} · ` : ''}${redactCommandLine(entry.task?.root.command || entry.args || entry.displayCommand)}`,
     ];
     table.push(ultraCompact ? [fullRow[1]!, fullRow[6]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[6]!] : fullRow);
   }
@@ -109,7 +125,18 @@ export function renderOutput(
     ];
     table.push(ultraCompact ? [fullRow[1]!, fullRow[6]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[6]!] : fullRow);
   }
-  lines.push(table.toString());
+  if (listeners.length + zombies.length > 0) lines.push(table.toString());
+  if (browsers.length > 0) {
+    const memory = browsers.every(({memoryBytes}) => memoryBytes !== null)
+      ? browsers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null;
+    lines.push('', `Dev browsers: ${browsers.length} · ${formatMemory(memory)} RSS sum (includes helpers)`,
+      '  PID      RAM        PROCS  AGE          FAMILY      PARENT');
+    for (const browser of browsers) {
+      lines.push(`  ${String(browser.pid).padEnd(8)} ${formatMemory(browser.memoryBytes).padEnd(10)} ${String(browser.members.length).padEnd(6)} ${formatAge(browser.ageSeconds).padEnd(12)} ${browser.family.padEnd(11)} ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState})`);
+    }
+    lines.push('RSS can count shared memory more than once. A running parent does not establish activity.',
+      'Stop one browser + helpers: portwarden --kill-pid <PID> (add --force for SIGKILL)');
+  }
   return lines.join('\n');
 }
 
@@ -161,6 +188,17 @@ function zombieToJson(entry: ZombieCandidate): Record<string, unknown> {
     reapable: entry.reapable,
     command: redactCommandLine(entry.command),
     reason: sanitizeText(entry.reason),
+  };
+}
+
+function browserToJson(entry: BrowserSession): Record<string, unknown> {
+  return {
+    type: 'browser', kind: entry.family, pid: entry.pid, ppid: entry.ppid,
+    ageSeconds: entry.ageSeconds, memoryBytes: entry.memoryBytes, memoryMetric: 'rss-sum',
+    processCount: entry.members.length, memberPids: entry.members.map(({pid}) => pid),
+    parentState: entry.parentState, parentName: sanitizeText(entry.parentName),
+    profile: sanitizeText(entry.profile), reason: sanitizeText(entry.reason),
+    command: redactCommandLine(entry.command),
   };
 }
 

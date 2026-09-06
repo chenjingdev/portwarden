@@ -159,8 +159,10 @@ function browserOptionLines(lines: readonly string[]): string[] {
 async function openBrowserPicker(app: ReturnType<typeof render>): Promise<void> {
   app.stdin.write('s');
   await update();
+  await vi.waitFor(() => expect(frameLines(app)).toContain('SETTINGS'));
   app.stdin.write('\r');
   await update();
+  await vi.waitFor(() => expect(frameLines(app)).toContain('BROWSER LIST'));
 }
 
 async function resize(app: ReturnType<typeof render>, columns: number, rows: number): Promise<void> {

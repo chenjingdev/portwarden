@@ -30,7 +30,7 @@ function listener(overrides: Partial<ListenerEntry> = {}): ListenerEntry {
 }
 
 describe('headless listener stops', () => {
-  it('skips a second PID in the same group only after a successful group outcome', async () => {
+  it('stops each explicitly selected PID even if a legacy outcome contains group metadata', async () => {
     const first = listener({pid: 101, pgid: 9_000, collectorPgid: 8_000});
     const firstAlias = listener({
       ...first,
@@ -54,9 +54,9 @@ describe('headless listener stops', () => {
     );
 
     expect(validateListener.mock.calls.map(([entry]) => entry.pid)).toEqual([101, 102]);
-    expect(stopListener.mock.calls.map(([entry]) => entry.pid)).toEqual([101]);
-    expect(outcomes).toEqual([{message: 'Stopped 101', pid: 101, pgid: 9_000}]);
-    expect(onOutcome).toHaveBeenCalledOnce();
+    expect(stopListener.mock.calls.map(([entry]) => entry.pid)).toEqual([101, 102]);
+    expect(outcomes.map(({pid}) => pid)).toEqual([101, 102]);
+    expect(onOutcome).toHaveBeenCalledTimes(2);
   });
 
   it('processes every distinct PID after group fallback and preserves warnings for output', async () => {

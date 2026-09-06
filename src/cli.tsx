@@ -10,7 +10,8 @@ import {ConfigRepository} from './config.js';
 import {formatActionOutcomes, stopListenerMatches} from './cliActions.js';
 import {PortwardenActions, type ActionOutcome, type StopSignal} from './core/actions.js';
 import {collectListeners, selectListeners} from './core/listeners.js';
-import type {ListenerEntry, ZombieCandidate} from './core/types.js';
+import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
+import {detectBrowserSessions} from './core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates, reapZombie} from './core/zombies.js';
 import {renderOutput, renderReapResults, type ReapResult} from './output.js';
 import {PortwardenApp} from './tui/App.js';
@@ -36,7 +37,7 @@ interface CliOptions {
 
 const program = new Command()
   .name('portwarden')
-  .description('Inspect, organize, and safely clean up local development ports.')
+  .description('Inspect and clean up local development ports and memory-hungry automation browsers.')
   .version(VERSION)
   .showSuggestionAfterError()
   .allowExcessArguments(false)
@@ -51,8 +52,8 @@ const program = new Command()
   .addOption(new Option('-w, --watch [seconds]', 'refresh plain/JSON output continuously').argParser(parsePositiveNumber).default(false))
   .addOption(new Option('-b, --browser <name>', 'browser application used by the TUI').argParser(parseNonEmpty))
   .addOption(new Option('--next-port <port>', 'print the next actually available port').argParser(parsePort))
-  .addOption(new Option('--kill-port <port>', 'stop listeners on a port (including a verified dev process group)').argParser(parsePort))
-  .addOption(new Option('--kill-pid <pid>', 'stop a listener scope or detected zombie PID').argParser(parsePositiveInteger))
+  .addOption(new Option('--kill-port <port>', 'stop the displayed task owning a port (including its launcher and workers)').argParser(parsePort))
+  .addOption(new Option('--kill-pid <pid>', 'stop the displayed dev task, browser tree, or standalone PID').argParser(parsePositiveInteger))
   .addHelpText('after', `
 Examples:
   $ portwarden
@@ -106,19 +107,21 @@ async function main(): Promise<void> {
   }
 
   const snapshot = await scan(configRepository, options);
-  console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, options));
+  console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, {...options, allListeners: snapshot.allListeners}, snapshot.browsers));
 }
 
 async function scan(
   configRepository: ConfigRepository,
   options: Pick<CliOptions, 'all' | 'json' | 'zombies'>,
-): Promise<{allListeners: ListenerEntry[]; listeners: ListenerEntry[]; zombies: ZombieCandidate[]}> {
+): Promise<{allListeners: ListenerEntry[]; listeners: ListenerEntry[]; zombies: ZombieCandidate[]; browsers: BrowserSession[]}> {
   const processPromise = collectProcesses();
   const listenerPromise = collectListeners({strict: true, processProvider: () => processPromise});
   const [processes, allListeners] = await Promise.all([processPromise, listenerPromise]);
   const config = configRepository.get();
+  const taskPids = new Set(allListeners.flatMap(({task}) => task?.members.map(({pid}) => pid) ?? []));
   return {
     allListeners,
+    browsers: detectBrowserSessions(processes).filter(({pid}) => !taskPids.has(pid)),
     listeners: selectListeners(allListeners, {
       all: options.all,
       pinnedListenerKeys: config.pinnedListenerKeys,
@@ -145,6 +148,16 @@ async function runDirectKill(actions: PortwardenActions, options: CliOptions): P
     return;
   }
 
+  const taskListener = allListeners.find(({task}) => task?.members.some(({pid}) => pid === options.killPid));
+  if (taskListener) {
+    printActionOutcome(await actions.stopListener(taskListener, signal));
+    return;
+  }
+  const browser = detectBrowserSessions(processes).find(({pid}) => pid === options.killPid);
+  if (browser) {
+    printActionOutcome(await actions.stopBrowser(browser, signal));
+    return;
+  }
   const listener = allListeners.find(({pid}) => pid === options.killPid);
   if (listener) {
     printActionOutcome(await actions.stopListener(listener, signal));
@@ -158,7 +171,7 @@ async function runDirectKill(actions: PortwardenActions, options: CliOptions): P
     printActionOutcome(await actions.stopZombie(zombie, signal));
     return;
   }
-  throw new Error(`PID ${options.killPid} is neither a current LISTEN process nor a detected automation zombie.`);
+  throw new Error(`PID ${options.killPid} is not a current dev browser, LISTEN process, or detected automation zombie.`);
 }
 
 function printActionOutcome(outcome: ActionOutcome): void {
@@ -204,9 +217,10 @@ async function runWatch(configRepository: ConfigRepository, options: CliOptions,
       }
       console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, {
         ...options,
+        allListeners: snapshot.allListeners,
         jsonLines: options.json,
         watchSeconds: seconds,
-      }));
+      }, snapshot.browsers));
       await delay(seconds * 1000, stopController.signal);
     }
   } finally {

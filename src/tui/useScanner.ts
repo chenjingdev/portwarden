@@ -2,13 +2,15 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import type {PortwardenConfig} from '../config.js';
 import {collectListeners, selectListeners} from '../core/listeners.js';
-import type {ListenerEntry, ZombieCandidate} from '../core/types.js';
+import type {BrowserSession, ListenerEntry, ZombieCandidate} from '../core/types.js';
+import {detectBrowserSessions} from '../core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates} from '../core/zombies.js';
 
 export interface ScannerSnapshot {
   allListeners: ListenerEntry[];
   listeners: ListenerEntry[];
   zombies: ZombieCandidate[];
+  browsers: BrowserSession[];
   loading: boolean;
   refreshing: boolean;
   error: string;
@@ -25,6 +27,7 @@ const INITIAL_SNAPSHOT: ScannerSnapshot = {
   allListeners: [],
   listeners: [],
   zombies: [],
+  browsers: [],
   loading: true,
   refreshing: false,
   error: '',
@@ -71,13 +74,17 @@ export function useScanner({all, showZombies, config}: ScannerOptions): ScannerS
           return;
         }
 
+        const taskPids = new Set(allListeners.flatMap(({task}) => task?.members.map(({pid}) => pid) ?? []));
+        const browsers = detectBrowserSessions(processes).filter(({pid}) => !taskPids.has(pid));
+        const browserPids = new Set(browsers.flatMap(({members}) => members.map(({pid}) => pid)));
         const zombies = detectZombieCandidates(processes, {
           listeningPids: new Set(allListeners.map(({pid}) => pid)),
-        });
+        }).filter(({pid}) => !browserPids.has(pid) && !taskPids.has(pid));
         setSnapshot({
           allListeners,
           listeners: allListeners,
           zombies,
+          browsers,
           loading: false,
           refreshing: false,
           error: '',

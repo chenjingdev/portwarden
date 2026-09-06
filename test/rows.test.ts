@@ -26,6 +26,24 @@ function listener(overrides: Partial<ListenerEntry>): ListenerEntry {
 }
 
 describe('buildVisibleRows', () => {
+  it('keeps the whole PID scope visible when only a hidden sibling port matches the filter', () => {
+    const first = listener({pid: 101, port: 3000});
+    const second = listener({pid: 101, port: 9222, kind: 'system'});
+    const rows = buildVisibleRows([first], [], {
+      all: false, expandedGroups: new Set(), pinnedListenerKeys: [],
+      allListeners: [first, second], query: '9222',
+    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({type: 'process', members: [first, second]});
+  });
+
+  it('does not merge separate PID stop scopes just because they share a PGID', () => {
+    const rows = buildVisibleRows([
+      listener({pid: 101, pgid: 9000}), listener({pid: 102, pgid: 9000}),
+    ], [], {all: false, expandedGroups: new Set(), pinnedListenerKeys: []});
+    expect(rows.map(({type}) => type)).toEqual(['listener', 'listener']);
+  });
+
   it('groups app helpers only in all scope and expands them by stable group key', () => {
     const entries = [
       listener({pid: 10, port: 5001, kind: 'app', appFamily: 'Ollama'}),

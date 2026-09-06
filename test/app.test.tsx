@@ -9,13 +9,15 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
 import {ConfigRepository} from '../src/config.js';
 import {PortwardenActions} from '../src/core/actions.js';
 import {listenerKey} from '../src/core/listeners.js';
-import type {ListenerEntry, ZombieCandidate} from '../src/core/types.js';
+import type {BrowserSession, ListenerEntry, ProcessTask, ZombieCandidate} from '../src/core/types.js';
+import {detectBrowserSessions} from '../src/core/browserSessions.js';
 import {PortwardenApp} from '../src/tui/App.js';
 
 const scanner = vi.hoisted(() => ({
   allListeners: [] as ListenerEntry[],
   listeners: [] as ListenerEntry[],
   zombies: [] as ZombieCandidate[],
+  browsers: [] as BrowserSession[],
   loading: false,
   refreshing: false,
   error: '',
@@ -41,6 +43,7 @@ beforeEach(() => {
   ];
   scanner.allListeners = [...scanner.listeners];
   scanner.zombies = [];
+  scanner.browsers = [];
   scanner.refresh.mockClear();
 });
 
@@ -50,6 +53,196 @@ afterEach(() => {
 });
 
 describe('PortwardenApp', () => {
+  it('shows a whole development task and sends its displayed scope when stopping a child port', async () => {
+    const entries = scanner.listeners.slice(0, 2);
+    const root = {pid: 99, ppid: 1, uid: process.getuid!(), executable: '/usr/bin/node', command: 'npm run dev', name: 'npm', cwd: '/tmp/project', startTime: new Date('2026-01-01')};
+    const task: ProcessTask = {
+      key: 'task:99', root, members: [root, ...entries.map((entry) => ({...root, pid: entry.pid, ppid: 99, command: entry.args}))],
+      ports: [3001, 3002], label: 'alpha', memoryBytes: null,
+    };
+    scanner.listeners = entries.map((entry) => ({...entry, task}));
+    scanner.allListeners = scanner.listeners;
+    const stopListener = vi.fn(async () => ({message: 'Stopped task.'}));
+    const repo = repository(); repo.update({confirmActions: true});
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    expect(app.lastFrame()).toContain('task 99  3 processes');
+    expect(app.lastFrame()).toContain('stops PIDs 99, 101, 102');
+    app.stdin.write('\r'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('x'); await update();
+    expect(app.lastFrame()).toContain('Stop task 99 (3 processes; ports 3001, 3002)?');
+    app.stdin.write('\r'); await update();
+    expect(stopListener).toHaveBeenCalledWith(scanner.listeners[0], 'SIGTERM');
+  });
+
+  it('allows retry and force-stop on the same target after a failure without masking the original error', async () => {
+    const stopListener = vi.fn(async () => { throw new Error('Helper identity could not be verified.'); });
+    const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    expect(app.lastFrame()).toContain('Helper identity could not be verified.');
+    app.stdin.write('x');
+    await update();
+    app.stdin.write('f');
+    await update();
+    expect(stopListener.mock.calls.map((call) => (call as unknown[])[1])).toEqual(['SIGTERM', 'SIGTERM', 'SIGKILL']);
+    expect(app.lastFrame()).toContain('Helper identity could not be verified.');
+    expect(app.lastFrame()).not.toContain('Choose a target with');
+  });
+
+  it('allows force-stop on the automatically selected replacement after a failed target disappears', async () => {
+    const repo = repository();
+    const stopListener = vi.fn(async () => { throw new Error('Partial cleanup'); });
+    const actions = {stopListener} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    scanner.listeners = scanner.listeners.slice(1);
+    scanner.allListeners = scanner.listeners;
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('f');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(2);
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGKILL');
+    expect(app.lastFrame()).not.toContain('Choose a target with');
+  });
+
+  it('treats a submitted search as an explicit selection so its result can be stopped immediately', async () => {
+    const stopListener = vi.fn(async () => ({message: 'Stopped.'}));
+    const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    app.stdin.write('/');
+    await update();
+    app.stdin.write('bravo');
+    await update();
+    app.stdin.write('\r');
+    await update();
+    app.stdin.write('x');
+    await update();
+    expect(stopListener).toHaveBeenCalledWith(scanner.listeners[1], 'SIGTERM');
+  });
+
+  it('shows dev browsers by default with memory and stops one complete session', async () => {
+    scanner.listeners = [];
+    scanner.allListeners = [];
+    scanner.browsers = detectBrowserSessions([{pid: 555, ppid: 1, uid: process.getuid!(), name: 'Google Chrome',
+      executable: '/Applications/Google Chrome', command: '/Applications/Google Chrome --remote-debugging-pipe --user-data-dir=/tmp/playwright_chromiumdev_profile-test',
+      startTime: new Date('2026-01-01'), rssBytes: 256 * 1024 ** 2}]);
+    const stopBrowser = vi.fn(async () => ({message: 'Stopped browser.'}));
+    const actions = {stopBrowser} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repository()} actionsOverride={actions} />);
+    await update();
+    expect(app.lastFrame()).toContain('1 browsers');
+    expect(app.lastFrame()).toContain('256 MiB');
+    expect(app.lastFrame()).toContain('hint x stop browser + helpers  f force-stop');
+    app.stdin.write('x');
+    await update();
+    expect(stopBrowser).toHaveBeenCalledWith(scanner.browsers[0], 'SIGTERM');
+  });
+
+  it('stops each automatically selected next row without requiring an arrow key', async () => {
+    const repo = repository();
+    const stopListener = vi.fn(async () => ({message: 'Stopped.'}));
+    const actions = {stopListener} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    scanner.listeners = scanner.listeners.slice(1);
+    scanner.allListeners = scanner.listeners;
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(2);
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGTERM');
+    scanner.listeners = scanner.listeners.slice(1);
+    scanner.allListeners = scanner.listeners;
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('f');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(3);
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGKILL');
+    expect(app.lastFrame()).not.toContain('Choose a target with');
+  });
+
+  it('ignores duplicate stop inputs only while an action is in flight, including before the busy render', async () => {
+    const pending = deferred<{message: string}>();
+    const repo = repository();
+    const stopListener = vi.fn(() => pending.promise);
+    const actions = {stopListener} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    app.stdin.write('x');
+    app.stdin.write('f');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(1);
+
+    scanner.listeners = scanner.listeners.slice(1);
+    scanner.allListeners = scanner.listeners;
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(1);
+
+    pending.resolve({message: 'Stopped.'});
+    await update();
+    app.stdin.write('x');
+    await update();
+    expect(stopListener).toHaveBeenCalledTimes(2);
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGTERM');
+  });
+
+  it('stops the next browser session at the same cursor position with another x', async () => {
+    scanner.listeners = [];
+    scanner.allListeners = [];
+    scanner.browsers = detectBrowserSessions([555, 556].map((pid) => ({
+      pid, ppid: 1, uid: process.getuid!(), name: 'Google Chrome', executable: '/Applications/Google Chrome',
+      command: `/Applications/Google Chrome --remote-debugging-pipe --user-data-dir=/tmp/playwright_chromiumdev_profile-${pid}`,
+      startTime: new Date('2026-01-01'), rssBytes: 256 * 1024 ** 2,
+    })));
+    const repo = repository();
+    const sessions = [...scanner.browsers];
+    const stopBrowser = vi.fn(async () => ({message: 'Stopped browser.'}));
+    const actions = {stopBrowser} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('x');
+    await update();
+    scanner.browsers = scanner.browsers.slice(1);
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    expect(app.lastFrame()).toContain('pid 556');
+    app.stdin.write('x');
+    await update();
+    expect(stopBrowser).toHaveBeenNthCalledWith(1, sessions[0], 'SIGTERM');
+    expect(stopBrowser).toHaveBeenNthCalledWith(2, sessions[1], 'SIGTERM');
+    expect(app.lastFrame()).not.toContain('Choose a target with');
+  });
+
+  it('groups ports in one PID and exposes the complete stop scope before acting', async () => {
+    const first = scanner.listeners[0]!;
+    const second = {...first, port: 4500, kind: 'system' as const};
+    scanner.listeners = [first];
+    scanner.allListeners = [first, second];
+    const repo = repository();
+    repo.update({confirmActions: true});
+    const app = render(<PortwardenApp configRepository={repo} />);
+    await update();
+    expect(app.lastFrame()).toContain('ports 3001, 4500');
+    expect(app.lastFrame()).toContain('share one process');
+    app.stdin.write('x');
+    await update();
+    expect(app.lastFrame()).toContain('Stop PID 101, ports 3001, 4500?');
+  });
+
   it('navigates the primary screens and treats pasted chunks as text, not actions', async () => {
     const app = render(<PortwardenApp configRepository={repository()} />);
     await update();
@@ -250,13 +443,17 @@ describe('PortwardenApp', () => {
     expect(app.lastFrame()).toContain('PID 101 also owns pinned port 3001.');
     expect(app.lastFrame()).not.toContain('enter/y confirm');
 
+    app.stdin.write('\r');
+    await update();
+    app.stdin.write('\u001B[B');
+    await update();
     app.stdin.write('m');
     await update();
     expect(app.lastFrame()).toContain('PID 101 also owns pinned port 3001. Unpin it before moving this process.');
     expect(app.lastFrame()).not.toContain('enter/y confirm');
   });
 
-  it('includes listeners from another PID in the same process group in the stop confirmation', async () => {
+  it('limits the stop confirmation to the selected PID even when another job shares its process group', async () => {
     const selected = listener({
       pid: 101,
       port: 3001,
@@ -287,11 +484,11 @@ describe('PortwardenApp', () => {
     await update();
 
     expect(app.lastFrame()).toContain('Force-stop port 3001');
-    expect(app.lastFrame()).toContain('also stops all:3002');
+    expect(app.lastFrame()).not.toContain('also stops all:3002');
     expect(app.lastFrame()).toContain('enter/y confirm');
   });
 
-  it('blocks a stop when another PID in the same process group owns a pinned listener', async () => {
+  it('keeps a pinned sibling job outside the selected PID stop scope', async () => {
     const selected = listener({
       pid: 101,
       port: 3001,
@@ -321,8 +518,8 @@ describe('PortwardenApp', () => {
     app.stdin.write('x');
     await update();
 
-    expect(app.lastFrame()).toContain('pinned port 3002');
-    expect(app.lastFrame()).not.toContain('enter/y confirm');
+    expect(app.lastFrame()).toContain('Stop port 3001');
+    expect(app.lastFrame()).toContain('enter/y confirm');
   });
 
   it('clears stale action errors when queuing an action or refreshing manually', async () => {

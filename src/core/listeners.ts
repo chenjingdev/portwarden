@@ -5,6 +5,7 @@ import process from 'node:process';
 import {execa} from 'execa';
 
 import {collectProcesses} from './zombies.js';
+import {attachProcessTasks} from './processTasks.js';
 import type {
   CommandResult,
   ListenerEntry,
@@ -335,7 +336,7 @@ export function parseLsofProcessMetadata(raw: string): Map<number, LsofProcessMe
   return metadata;
 }
 
-async function collectProcessMetadata(
+export async function collectProcessMetadata(
   pids: readonly number[],
   options: Pick<CollectListenersOptions, 'runCommand' | 'signal' | 'strict'>,
 ): Promise<Map<number, LsofProcessMetadata>> {
@@ -454,7 +455,8 @@ export async function collectListeners(options: CollectListenersOptions = {}): P
     ];
   });
 
-  return sortListeners(collapseEquivalentListeners(enriched));
+  return attachProcessTasks(sortListeners(collapseEquivalentListeners(enriched)), processes,
+    (pids) => collectProcessMetadata(pids, options));
 }
 
 export function enrichListener(
