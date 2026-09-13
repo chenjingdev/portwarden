@@ -543,7 +543,9 @@ function hasDevEvidence(details: ListenerDetails): boolean {
   const inLibrary = cwd === path.join(home, 'Library') || cwd.startsWith(`${path.join(home, 'Library')}${path.sep}`);
   const hasProjectCwd = Boolean(cwd) && inHome && !inLibrary && cwd !== home;
   const hasDevKeyword = DEV_KEYWORDS.some((keyword) => matchesKeyword(searchText, keyword));
-  const runtime = RUNTIME_NAMES.has(commandName);
+  // lsof reports the interpreter version (for example python3.12) even when
+  // a virtualenv was launched through its unversioned python/python3 symlink.
+  const runtime = RUNTIME_NAMES.has(commandName) || /^python\d+(?:\.\d+)*$/.test(commandName);
   const port = details.port ?? 0;
   const commonDevPort = DEV_PORTS.has(port) || (port >= 3000 && port <= 5999);
   return hasDevKeyword || (hasProjectCwd && (runtime || commonDevPort)) || (runtime && commonDevPort);

@@ -234,6 +234,29 @@ describe('lsof parsing and enrichment', () => {
     });
   });
 
+  it.each([
+    {port: 8765, args: '/Users/test/dev/flypiano/.venv/bin/python3 /Users/test/dev/flypiano/.venv/bin/flypiano sim live --port 8765'},
+    {port: 8767, args: '.venv/bin/python .venv/bin/flypiano sim live --port 8766'},
+  ])('shows flypiano on port $port as a development listener', async ({port, args: command}) => {
+    const result = await collectListeners({
+      home: '/Users/test',
+      runCommand: async (_file, args) => args.includes('-iTCP')
+        ? {exitCode: 0, stdout: `p101\ncpython3.12\nn127.0.0.1:${port}\n`}
+        : {exitCode: 0, stdout: 'p101\nfcwd\nn/Users/test/dev/flypiano\nftxt\nn/opt/python/bin/python3.12\n'},
+      processProvider: async () => [{
+        pid: 101,
+        ppid: 1,
+        name: 'python3.12',
+        command,
+        executable: '',
+      }],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({port, kind: 'dev', projectName: 'flypiano', args: command});
+    expect(selectListeners(result)).toEqual(result);
+  });
+
   it('degrades to an empty list by default but surfaces lsof failures in strict mode', async () => {
     const runCommand = async () => ({exitCode: 2, stdout: '', stderr: 'permission denied'});
     await expect(collectListeners({runCommand})).resolves.toEqual([]);
@@ -271,6 +294,44 @@ describe('classification and identity', () => {
       home: '/Users/test',
     })).toBe('dev');
     expect(classifyListener({command: 'postgres', cwd: '/opt/postgres', port: 5432})).toBe('system');
+  });
+
+  it.each(['python3.11', 'python3.12', 'python3.13', '/opt/python/bin/python3.12', 'Python3.12'])(
+    'recognizes the versioned runtime %s on an uncommon development port', (command) => {
+      expect(classifyListener({
+        command,
+        cwd: '/Users/test/dev/sample',
+        port: 8765,
+        home: '/Users/test',
+      })).toBe('dev');
+    },
+  );
+
+  it.each(['python3.12-helper', 'mypython3.12', 'python3.x'])(
+    'does not identify %s as a Python runtime', (command) => {
+      expect(classifyListener({
+        command,
+        cwd: '/Users/test/dev/sample',
+        port: 8765,
+        home: '/Users/test',
+      })).toBe('system');
+    },
+  );
+
+  it('requires development evidence for versioned Python and preserves app classification', () => {
+    expect(classifyListener({
+      command: 'python3.12',
+      cwd: '/opt/service',
+      port: 8765,
+      home: '/Users/test',
+    })).toBe('system');
+    expect(classifyListener({
+      command: 'python3.12',
+      executable: '/Applications/Example.app/Contents/MacOS/python3.12',
+      cwd: '/Users/test/dev/sample',
+      port: 8765,
+      home: '/Users/test',
+    })).toBe('app');
   });
 
   it('does not treat an ancillary Application Support argument as the process app identity', () => {
