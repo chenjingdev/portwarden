@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  ink@6.8.0:
+    hash: 091c7f45900fc591c1e08b023fed8b105415a337fbff599027f466ba3264d625
+    path: patches/ink@6.8.0.patch
+
 importers:
 
   .:
@@ -25,7 +30,7 @@ importers:
         version: 7.2.0
       ink:
         specifier: ^6.8.0
-        version: 6.8.0(@types/react@19.2.18)(react@19.2.8)
+        version: 6.8.0(patch_hash=091c7f45900fc591c1e08b023fed8b105415a337fbff599027f466ba3264d625)(@types/react@19.2.18)(react@19.2.8)
       open:
         specifier: ^11.0.1
         version: 11.0.1
@@ -2616,7 +2621,7 @@ snapshots:
     optionalDependencies:
       '@types/react': 19.2.18
 
-  ink@6.8.0(@types/react@19.2.18)(react@19.2.8):
+  ink@6.8.0(patch_hash=091c7f45900fc591c1e08b023fed8b105415a337fbff599027f466ba3264d625)(@types/react@19.2.18)(react@19.2.8):
     dependencies:
       '@alcalzone/ansi-tokenize': 0.2.5
       ansi-escapes: 7.3.0

@@ -1,0 +1,61 @@
+diff --git a/build/measure-text.js b/build/measure-text.js
+index 6934dc529bf94feed37afdf95633e4f36c6aad32..d0a57df69e24984e3ca646302b71b774b7318cc7 100644
+--- a/build/measure-text.js
++++ b/build/measure-text.js
+@@ -1,5 +1,8 @@
+ import widestLine from 'widest-line';
+ const cache = new Map();
++// Long-running dashboards generate a new string for every clock/age update.
++const maxCacheEntries = 2048;
++const maxCacheTextLength = 4096;
+ const measureText = (text) => {
+     if (text.length === 0) {
+         return {
+@@ -14,7 +17,12 @@ const measureText = (text) => {
+     const width = widestLine(text);
+     const height = text.split('\n').length;
+     const dimensions = { width, height };
+-    cache.set(text, dimensions);
++    if (text.length <= maxCacheTextLength) {
++        if (cache.size >= maxCacheEntries) {
++            cache.delete(cache.keys().next().value);
++        }
++        cache.set(text, dimensions);
++    }
+     return dimensions;
+ };
+ export default measureText;
+diff --git a/build/wrap-text.js b/build/wrap-text.js
+index 7cee4b8a500df85b2df3294904834c0091289e8c..30e7bcc232e3fb5e4d977f572580891d8587dc82 100644
+--- a/build/wrap-text.js
++++ b/build/wrap-text.js
+@@ -1,10 +1,12 @@
+ import wrapAnsi from 'wrap-ansi';
+ import cliTruncate from 'cli-truncate';
+-const cache = {};
++const cache = new Map();
++const maxCacheEntries = 2048;
++const maxCacheTextLength = 4096;
+ const wrapText = (text, maxWidth, wrapType) => {
+     const cacheKey = text + String(maxWidth) + String(wrapType);
+-    const cachedText = cache[cacheKey];
+-    if (cachedText) {
++    const cachedText = cache.get(cacheKey);
++    if (cachedText !== undefined) {
+         return cachedText;
+     }
+     let wrappedText = text;
+@@ -24,7 +26,12 @@ const wrapText = (text, maxWidth, wrapType) => {
+         }
+         wrappedText = cliTruncate(text, maxWidth, { position });
+     }
+-    cache[cacheKey] = wrappedText;
++    if (text.length <= maxCacheTextLength && wrappedText.length <= maxCacheTextLength) {
++        if (cache.size >= maxCacheEntries) {
++            cache.delete(cache.keys().next().value);
++        }
++        cache.set(cacheKey, wrappedText);
++    }
+     return wrappedText;
+ };
+ export default wrapText;

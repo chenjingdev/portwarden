@@ -3,3 +3,5 @@ packages:
 
 allowBuilds:
   esbuild: true
+patchedDependencies:
+  ink@6.8.0: patches/ink@6.8.0.patch

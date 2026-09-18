@@ -292,6 +292,42 @@ describe('PortwardenApp', () => {
     expect(frame).not.toContain('charlie');
   });
 
+  it('pins every port in a collapsed PID including hidden siblings and can unpin without expanding', async () => {
+    const first = listener({pid: 101, port: 3001});
+    const hidden = listener({pid: 101, port: 9222, kind: 'system'});
+    scanner.listeners = [first];
+    scanner.allListeners = [first, hidden];
+    const repo = repository();
+    const stopListener = vi.fn(async () => ({message: 'Stopped.'}));
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual([listenerKey(first), listenerKey(hidden)]);
+    expect(app.lastFrame()).toContain('entire PID protected');
+    app.stdin.write('x'); await update();
+    expect(stopListener).not.toHaveBeenCalled();
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual([]);
+    expect(app.lastFrame()).toContain('Unpinned');
+  });
+
+  it('keeps an app group selected when pinning and unpinning all its ports', async () => {
+    scanner.listeners = [
+      listener({pid: 101, port: 3001, kind: 'app', appFamily: 'Ollama'}),
+      listener({pid: 102, port: 3002, kind: 'app', appFamily: 'Ollama'}),
+    ];
+    scanner.allListeners = scanner.listeners;
+    const repo = repository();
+    const app = render(<PortwardenApp configRepository={repo} initialAll />);
+    await update();
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual(scanner.listeners.map(listenerKey));
+    expect(app.lastFrame()).toContain('group Ollama');
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual([]);
+    expect(app.lastFrame()).toContain('group Ollama');
+  });
+
   it('appends a new pin after existing visible pins and preserves its selection', async () => {
     const repo = repository();
     repo.update({

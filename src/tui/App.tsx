@@ -219,18 +219,21 @@ export function PortwardenApp({
 
   const toggleSelectedPin = () => {
     pendingSelectionKey.current = null;
-    if (selectedRow?.type !== 'listener') {
-      setActionError((selectedRow?.type === 'group' || selectedRow?.type === 'process') ? 'Expand the app group and select one listener to pin it.' : 'Only LISTEN ports can be pinned.');
+    if (selectedRow?.type !== 'listener' && selectedRow?.type !== 'group' && selectedRow?.type !== 'process') {
+      setActionError('Only LISTEN ports and their groups can be pinned.');
       return;
     }
-    const aliases = new Set(listenerKeys(selectedRow.listener));
-    const pinned = config.pinnedListenerKeys.some((key) => aliases.has(key));
+    const members = selectedRow.type === 'listener' ? [selectedRow.listener] : selectedRow.members;
+    const aliases = new Set(members.flatMap(listenerKeys));
+    const pinned = members.every((entry) => listenerIsPinned(entry, config.pinnedListenerKeys));
     const next = config.pinnedListenerKeys.filter((key) => !aliases.has(key));
-    if (!pinned) next.push(listenerKey(selectedRow.listener));
+    if (!pinned) next.push(...new Set(members.map(listenerKey)));
+    if (selectedRow.type === 'group') {
+      pendingSelectionKey.current = `group:${pinned ? 'regular' : 'pinned'}:${selectedRow.family.toLowerCase()}`;
+    }
 
-    const selectedIdentity = selectionKey(selectedRow.listener);
-    const selectedOrderKey = listenerKey(selectedRow.listener);
-    const otherListeners = scanner.listeners.filter((listener) => selectionKey(listener) !== selectedIdentity);
+    const selectedIdentities = new Set(members.map(selectionKey));
+    const otherListeners = scanner.listeners.filter((listener) => !selectedIdentities.has(selectionKey(listener)));
     const pinnedListeners = otherListeners.filter((listener) => listenerIsPinned(listener, config.pinnedListenerKeys));
     const regularListeners = otherListeners.filter((listener) => !listenerIsPinned(listener, config.pinnedListenerKeys));
     const visibleAliases = new Set(scanner.listeners.flatMap((listener) => [
@@ -241,13 +244,13 @@ export function PortwardenApp({
     const staleSavedOrder = config.orderedEntryKeys.filter((key) => !visibleAliases.has(key));
     const orderedEntryKeys = [
       ...pinnedListeners.map(listenerKey),
-      selectedOrderKey,
+      ...members.map(listenerKey),
       ...regularListeners.map(listenerKey),
       ...staleSavedOrder,
     ];
     saveConfig(
       {pinnedListenerKeys: next, orderedEntryKeys},
-      `${pinned ? 'Unpinned' : 'Pinned'} ${selectedRow.listener.displayProject || selectedRow.listener.command}:${selectedRow.listener.port}.`,
+      `${pinned ? 'Unpinned' : 'Pinned'} ${selectedRow.type === 'listener' ? `${selectedRow.listener.displayProject || selectedRow.listener.command}:${selectedRow.listener.port}` : `${selectedRow.family} (${members.length} ports)`}.`,
     );
   };
 
@@ -749,7 +752,7 @@ function DataRow({row, selected, widths, config, columns}: {
       <TableRow
         values={[
           'APP',
-          '-',
+          row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-',
           `${row.members.length}x`,
           '-',
           '-',
@@ -859,14 +862,14 @@ function detailLines(
       `stops PIDs ${task.members.map(({pid}) => pid).join(', ')}  including launcher + workers`,
       task.blockedReason || `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire task protected' : 'NO'}  dir ${sanitizeText(task.root.cwd)}`,
       `cmd ${redactCommandLine(task.root.command)}`,
-      'hint enter expand/collapse ports  x stop whole task  f force-stop',
+      'hint enter expand/collapse ports  p pin group  x stop whole task  f force-stop',
     ];
     return [
       `pid ${listener.pid}  ${row.members.length} listeners share one process  age ${listener.elapsed}`,
       `stopping this PID closes ALL ports: ${[...new Set(row.members.map(({port}) => port))].join(', ')}`,
       `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire PID protected' : 'NO'}  dir ${sanitizeText(listener.displayCwd)}`,
       `cmd ${redactCommandLine(listener.args)}`,
-      'hint enter expand/collapse  x stop entire PID  f force-stop  expand to pin/open a port',
+      'hint enter expand/collapse  x stop entire PID  f force-stop  p pin group  expand to open a port',
     ];
   }
   if (row.type === 'browser') {
@@ -889,7 +892,7 @@ function detailLines(
       `group ${row.family}  kind APP  listeners ${row.members.length}  state ${row.expanded ? 'expanded' : 'collapsed'}`,
       `ports ${ports.slice(0, 5).join(', ')}${ports.length > 5 ? ` +${ports.length - 5}` : ''}  host ${hosts.join(', ') || '-'}`,
       `apps ${commands.slice(0, 4).join(' · ') || '-'}`,
-      `hint enter ${row.expanded ? 'collapse' : 'expand'}  choose a listener to open, pin, move, or stop`,
+      `hint enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  choose a listener to open, move, or stop`,
       `proc ${commands[0] || '-'}`,
     ];
   }
@@ -936,9 +939,9 @@ function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number})
   const shortcuts = row?.type === 'browser'
     ? 'x stop browser + helpers  f force-stop  a all/main  / filter  r refresh  ? help  q quit'
     : row?.type === 'process'
-      ? 'enter expand/collapse  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
+      ? 'enter expand/collapse  p pin group  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
     : row?.type === 'group'
-    ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
+    ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
     : row?.type === 'listener' && row.parentGroupKey
       ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
       : row?.type === 'zombie'
@@ -1095,7 +1098,7 @@ function HelpScreen() {
       <Text>enter    expand/collapse an app group</Text>
       <Text>a        toggle main/all LISTEN ports</Text>
       <Text>z        show/hide orphaned browser-automation processes</Text>
-      <Text>p        pin/unpin one listener (pinned listeners cannot be stopped)</Text>
+      <Text>p        pin/unpin a listener or group (pinned listeners cannot be stopped)</Text>
       <Text>o / m    open in browser / safely move to the next verified port</Text>
       <Text>x / f    SIGTERM / SIGKILL</Text>
       <Text>g / s    graveyard / settings</Text>

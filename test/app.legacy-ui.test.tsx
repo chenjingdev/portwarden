@@ -99,7 +99,7 @@ describe('legacy main-screen UI contract', () => {
     expect.soft(lines[0]).toBe('PORTWARDEN  [ALL] [2 ports] [1 rows]');
     expect.soft(groupRow).toMatch(/^> .*\bAPP\b.*\b2x\b.*> Antigravity.*closed.*2 listeners/);
     expect.soft(lines).toContain('DETAILS  Antigravity');
-    expect.soft(lines.some((line) => /^keys: → expand  enter expand  a all\/main/.test(line))).toBe(true);
+    expect.soft(lines.some((line) => /^keys: → expand  enter expand  p pin group  a all\/main/.test(line))).toBe(true);
 
     app.stdin.write('\u001B[C');
     await update();
@@ -108,7 +108,7 @@ describe('legacy main-screen UI contract', () => {
     const unselectedChild = lines.find((line) => line.includes('6101') && line.includes('helper-one'));
     expect.soft(groupRow).toMatch(/^> .*\bAPP\b.*\b2x\b.*v Antigravity.*open.*2 listeners/);
     expect.soft(unselectedChild).toMatch(/^  .*\| helper-one/);
-    expect.soft(lines.some((line) => /^keys: ← collapse  enter collapse  a all\/main/.test(line))).toBe(true);
+    expect.soft(lines.some((line) => /^keys: ← collapse  enter collapse  p pin group  a all\/main/.test(line))).toBe(true);
 
     app.stdin.write('\u001B[B');
     await update();
@@ -151,7 +151,7 @@ describe('legacy main-screen UI contract', () => {
     expect.soft(tableRows.some((line) => line.includes('6101') || line.includes('6102'))).toBe(false);
     expect.soft(lines).toContain('DETAILS  Antigravity');
     expect.soft(lines).toContain('group Antigravity  kind APP  listeners 2  state collapsed');
-    expect.soft(lines.some((line) => /^keys: → expand  enter expand  a all\/main/.test(line))).toBe(true);
+    expect.soft(lines.some((line) => /^keys: → expand  enter expand  p pin group  a all\/main/.test(line))).toBe(true);
     expect.soft(repo.get().orderedEntryKeys).toEqual([]);
   });
 

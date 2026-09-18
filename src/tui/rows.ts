@@ -45,13 +45,12 @@ export function buildVisibleRows(
   for (const listener of eligible) {
     if (listener.task || (byPid.get(scopeKey(listener))?.length ?? 0) > 1) continue;
     if (
-      options.all &&
+      (options.all || listenerIsPinned(listener, options.pinnedListenerKeys)) &&
       listener.kind === 'app' &&
-      listener.appFamily &&
-      !listenerIsPinned(listener, options.pinnedListenerKeys)
+      listener.appFamily
     ) {
       const family = listener.appFamily;
-      const bucketKey = family.toLowerCase();
+      const bucketKey = `${listenerIsPinned(listener, options.pinnedListenerKeys) ? 'pinned' : 'regular'}:${family.toLowerCase()}`;
       const bucket = grouped.get(bucketKey) ?? {family, members: []};
       bucket.members.push(listener);
       grouped.set(bucketKey, bucket);
@@ -72,17 +71,17 @@ export function buildVisibleRows(
     }
     if (
       !(
-        options.all &&
+        (options.all || listenerIsPinned(listener, options.pinnedListenerKeys)) &&
         listener.kind === 'app' &&
-        listener.appFamily &&
-        !listenerIsPinned(listener, options.pinnedListenerKeys)
+        listener.appFamily
       )
     ) {
       listenerRows.push(listenerRow(listener));
       continue;
     }
 
-    const bucketKey = listener.appFamily.toLowerCase();
+    const isPinned = listenerIsPinned(listener, options.pinnedListenerKeys);
+    const bucketKey = `${isPinned ? 'pinned' : 'regular'}:${listener.appFamily.toLowerCase()}`;
     const bucket = grouped.get(bucketKey)!;
     if (bucket.members.length < 2) {
       listenerRows.push(listenerRow(listener));
@@ -92,11 +91,12 @@ export function buildVisibleRows(
       continue;
     }
     emittedGroups.add(bucketKey);
-    const groupKey = `group:regular:${bucketKey}`;
+    const groupKey = `group:${bucketKey}`;
     const expanded = options.expandedGroups.has(groupKey);
-    groupedRows.push({type: 'group', key: groupKey, family: bucket.family, members: bucket.members, expanded, depth: 0});
+    const destination = isPinned ? listenerRows : groupedRows;
+    destination.push({type: 'group', key: groupKey, family: bucket.family, members: bucket.members, expanded, depth: 0});
     if (expanded) {
-      groupedRows.push(...bucket.members.map((member) => listenerRow(member, 1, groupKey)));
+      destination.push(...bucket.members.map((member) => listenerRow(member, 1, groupKey)));
     }
   }
 
