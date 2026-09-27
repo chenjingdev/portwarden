@@ -15,6 +15,9 @@ import {detectBrowserSessions} from './core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates, reapZombie} from './core/zombies.js';
 import {renderOutput, renderReapResults, type ReapResult} from './output.js';
 import {PortwardenApp} from './tui/App.js';
+import {startDiagnostics} from './diagnostics.js';
+
+let diagnostics: ReturnType<typeof startDiagnostics> | undefined;
 
 const packageMetadata = createRequire(import.meta.url)('../package.json') as {version: string};
 const VERSION = packageMetadata.version;
@@ -91,6 +94,7 @@ async function main(): Promise<void> {
 
   const configRepository = ConfigRepository.open();
   if (options.tui || defaultTui) {
+    diagnostics = startDiagnostics();
     await runTui(configRepository, options);
     return;
   }
@@ -235,7 +239,15 @@ async function runTui(configRepository: ConfigRepository, options: CliOptions): 
   }
   let instance: ReturnType<typeof render> | undefined;
   let alternateScreen = false;
-  const terminate = () => instance?.unmount();
+  const terminate = (signal: NodeJS.Signals) => {
+    diagnostics?.record('signal', {signal});
+    if (signal === 'SIGINT') process.exitCode = 130;
+    if (signal === 'SIGHUP') process.exitCode = 129;
+    instance?.unmount();
+  };
+  const onTerm = () => terminate('SIGTERM');
+  const onInt = () => terminate('SIGINT');
+  const onHangup = () => terminate('SIGHUP');
   try {
     process.stdout.write('\u001B[?1049h\u001B[H\u001B[2J');
     alternateScreen = true;
@@ -245,13 +257,19 @@ async function runTui(configRepository: ConfigRepository, options: CliOptions): 
         initialAll={options.all}
         initialZombies={options.zombies}
         browserOverride={options.browser ?? process.env.PORTWARDEN_BROWSER ?? process.env.DEV_PORTS_BROWSER}
+        onExitReason={(reason) => diagnostics?.record('user-exit', {reason})}
       />,
       {exitOnCtrlC: false, incrementalRendering: true},
     );
-    process.once('SIGTERM', terminate);
+    process.once('SIGTERM', onTerm);
+    process.once('SIGINT', onInt);
+    process.once('SIGHUP', onHangup);
     await instance.waitUntilExit();
+    diagnostics?.record('tui-unmounted');
   } finally {
-    process.removeListener('SIGTERM', terminate);
+    process.removeListener('SIGTERM', onTerm);
+    process.removeListener('SIGINT', onInt);
+    process.removeListener('SIGHUP', onHangup);
     instance?.unmount();
     if (alternateScreen) {
       process.stdout.write('\u001B[?25h\u001B[?1049l');
@@ -319,6 +337,7 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
 }
 
 main().catch((error) => {
+  diagnostics?.error('fatal-error', error);
   console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
 });

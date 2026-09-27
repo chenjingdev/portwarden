@@ -18,6 +18,7 @@ import {formatMemory} from '../core/browserSessions.js';
 import {normalizeShortcut} from './keymap.js';
 import {buildVisibleRows, listenerIsPinned, type VisibleRow} from './rows.js';
 import {useScanner} from './useScanner.js';
+import {failedRowsLast, processIdentity, rowIdentities, type StopPresentation} from './optimisticStops.js';
 
 type Screen = 'main' | 'settings' | 'browser' | 'graveyard' | 'help';
 
@@ -33,6 +34,7 @@ export interface PortwardenAppProps {
   initialZombies?: boolean;
   browserOverride?: string;
   actionsOverride?: PortwardenActions;
+  onExitReason?: (reason: 'ctrl-c' | 'quit-key') => void;
 }
 
 const REFRESH_INTERVALS = [1, 2, 5, 10];
@@ -43,6 +45,7 @@ export function PortwardenApp({
   initialZombies = false,
   browserOverride = '',
   actionsOverride,
+  onExitReason,
 }: PortwardenAppProps) {
   const {exit} = useApp();
   const {write: writeStdout} = useStdout();
@@ -65,6 +68,15 @@ export function PortwardenApp({
   const [actionWarning, setActionWarning] = useState('');
   const actionInFlight = useRef(false);
   const [busy, setBusy] = useState('');
+  const [stops, setStops] = useState<StopPresentation[]>([]);
+  const stopsRef = useRef<StopPresentation[]>([]);
+  const stopSequence = useRef(0);
+  const stopQueue = useRef(Promise.resolve());
+  const updateStops = (next: StopPresentation[]) => {
+    stopsRef.current = next;
+    setStops(next);
+  };
+  const pendingStopCount = stops.filter(({phase}) => phase === 'pending').length;
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const selectionIndexHint = useRef(0);
   const pendingSelectionKey = useRef<string | null>(null);
@@ -83,17 +95,30 @@ export function PortwardenApp({
     [config.browser, installedBrowsers, normalizedBrowserOverride],
   );
   const scanner = useScanner({all, showZombies, config});
+  const hiddenIdentities = useMemo(() => new Set(stops.filter(({phase}) => phase !== 'failed').flatMap(({identities}) => identities)), [stops]);
+  const failedIdentities = useMemo(() => new Set(stops.filter(({phase}) => phase === 'failed').flatMap(({identities}) => identities)), [stops]);
   const visibleRows = useMemo(
-    () => buildVisibleRows(scanner.listeners, scanner.zombies, {
+    () => failedRowsLast(buildVisibleRows(
+      scanner.listeners.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
+      scanner.zombies.filter((entry) => !hiddenIdentities.has(processIdentity(entry))), {
       all,
       expandedGroups,
       pinnedListenerKeys: config.pinnedListenerKeys,
       query,
-      browsers: scanner.browsers,
-      allListeners: scanner.allListeners,
-    }),
-    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies, scanner.browsers, scanner.allListeners],
+      browsers: scanner.browsers?.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
+      allListeners: scanner.allListeners.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
+    }), failedIdentities),
+    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies, scanner.browsers, scanner.allListeners, hiddenIdentities, failedIdentities],
   );
+  useEffect(() => {
+    const live = new Set([
+      ...scanner.allListeners.flatMap((entry) => (entry.task?.members ?? [entry]).map(processIdentity)),
+      ...(scanner.browsers ?? []).flatMap((entry) => entry.members.map(processIdentity)),
+      ...scanner.zombies.map(processIdentity),
+    ]);
+    const next = stopsRef.current.filter((entry) => entry.phase === 'pending' || entry.identities.some((id) => live.has(id)));
+    if (next.length !== stopsRef.current.length) updateStops(next);
+  }, [scanner.allListeners, scanner.browsers, scanner.zombies]);
   const selectedIndex = selectedKey ? visibleRows.findIndex(({key}) => key === selectedKey) : -1;
   const effectiveSelectedIndex = visibleRows.length === 0
     ? -1
@@ -155,6 +180,10 @@ export function PortwardenApp({
 
   const runAction = async (label: string, action: () => Promise<ActionOutcome | string>) => {
     if (actionInFlight.current) return;
+    if (stopsRef.current.some(({phase}) => phase === 'pending')) {
+      setActionError('Wait for queued stops before starting another action.');
+      return;
+    }
     actionInFlight.current = true;
     setBusy(label);
     setActionError('');
@@ -344,14 +373,49 @@ export function PortwardenApp({
       : selectedRow.type === 'browser'
         ? `browser PID ${selectedRow.browser.pid} (${selectedRow.browser.members.length} processes, ${formatMemory(selectedRow.browser.memoryBytes)} RSS)`
         : selectedRow.type === 'zombie' ? `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})` : '';
+    const identities = [...new Set([
+      ...rowIdentities(selectedRow),
+      ...(listener ? scanner.allListeners.filter((entry) => listenerSharesStopScope(listener, entry)).map(processIdentity) : []),
+    ])];
     queueAction(
       signal === 'SIGKILL' ? `Force-stop ${target}?` : `Stop ${target}?`,
       signal === 'SIGKILL' ? 'SIGKILL does not allow cleanup.' : 'SIGTERM lets the process clean up first.',
-      async () => runAction(signal === 'SIGKILL' ? 'Force-stopping…' : 'Stopping…', () =>
-          listener ? actions.stopListener(listener, signal)
-            : selectedRow.type === 'browser' ? actions.stopBrowser(selectedRow.browser, signal)
-              : selectedRow.type === 'zombie' ? actions.stopZombie(selectedRow.zombie, signal) : Promise.resolve('No process selected.'),
-      ),
+      async () => {
+        // The ref closes the gap before React commits the hidden row, preventing
+        // repeated input from queueing the same scope twice.
+        if (stopsRef.current.some((entry) => entry.phase !== 'failed' && entry.identities.some((id) => identities.includes(id)))) return;
+        const id = ++stopSequence.current;
+        const remaining = visibleRows.filter((row) => !rowIdentities(row).some((identity) => identities.includes(identity)));
+        pendingSelectionKey.current = null;
+        const precedingCount = visibleRows.slice(0, effectiveSelectedIndex)
+          .filter((row) => !rowIdentities(row).some((identity) => identities.includes(identity))).length;
+        const nextIndex = Math.min(precedingCount, remaining.length - 1);
+        selectionIndexHint.current = Math.max(0, nextIndex);
+        setSelectedKey(remaining[nextIndex]?.key ?? null);
+        updateStops([
+          ...stopsRef.current.filter((entry) => !entry.identities.some((identity) => identities.includes(identity))),
+          {id, identities, phase: 'pending'},
+        ]);
+        setStatus(`Queued stop: ${target}.`);
+        // Present immediately, but serialize destructive work and config writes.
+        stopQueue.current = stopQueue.current.then(async () => {
+          try {
+            const result = listener ? await actions.stopListener(listener, signal)
+              : selectedRow.type === 'browser' ? await actions.stopBrowser(selectedRow.browser, signal)
+                : selectedRow.type === 'zombie' ? await actions.stopZombie(selectedRow.zombie, signal) : {message: 'No process selected.'};
+            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'stopped'} : entry));
+            setStatus(result.message);
+            setActionWarning(result.warning ?? '');
+          } catch (error) {
+            const message = errorMessage(error);
+            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'failed', error: message} : entry));
+            setActionError(message);
+          } finally {
+            try { refreshConfig(); } catch { /* Keep the stop outcome visible. */ }
+            try { scanner.refresh(); } catch { /* Retry on the next scan. */ }
+          }
+        });
+      },
     );
   };
 
@@ -422,7 +486,10 @@ export function PortwardenApp({
   useInput((input, key) => {
     const normalized = normalizeShortcut(input, key);
     if (key.ctrl && normalized === 'c') {
-      if (!actionInFlight.current) exit();
+      if (!actionInFlight.current && !stopsRef.current.some(({phase}) => phase === 'pending')) {
+        onExitReason?.('ctrl-c');
+        exit();
+      }
       return;
     }
     if (key.ctrl && normalized === 'l') {
@@ -521,6 +588,11 @@ export function PortwardenApp({
     } else if (key.return && selectedRow?.type === 'listener' && selectedRow.parentGroupKey) {
       collapseParentGroup(selectedRow);
     } else if (normalized === 'q') {
+      if (stopsRef.current.some(({phase}) => phase === 'pending')) {
+        setStatus('Waiting for queued stops to finish before quitting.');
+        return;
+      }
+      onExitReason?.('quit-key');
       exit();
     } else if (normalized === 'a') {
       pendingSelectionKey.current = null;
@@ -637,6 +709,7 @@ export function PortwardenApp({
       ) : null}
       <MainTable
         rows={visibleRows}
+        failedIdentities={failedIdentities}
         selectedIndex={effectiveSelectedIndex}
         config={config}
         columns={columns}
@@ -649,7 +722,7 @@ export function PortwardenApp({
       {confirmation ? (
         <ConfirmationBox confirmation={confirmation} />
       ) : (
-        <StatusLine busy={busy} status={status} error={actionError || scanner.error} warning={actionWarning} />
+        <StatusLine busy={busy || (pendingStopCount ? `Stopping ${pendingStopCount} item(s)… You can select and stop the next item.` : '')} status={status} error={actionError || (selectedRow ? stops.find((entry) => entry.phase === 'failed' && entry.identities.some((id) => rowIdentities(selectedRow).includes(id)))?.error : '') || scanner.error} warning={actionWarning} />
       )}
     </Box>
   );
@@ -692,6 +765,7 @@ function MainHeader(props: {
 
 function MainTable(props: {
   rows: readonly VisibleRow[];
+  failedIdentities: ReadonlySet<string>;
   selectedIndex: number;
   config: PortwardenConfig;
   columns: number;
@@ -718,6 +792,7 @@ function MainTable(props: {
         <DataRow
           key={row.key}
           row={row}
+          failed={rowIdentities(row).some((id) => props.failedIdentities.has(id))}
           selected={offset + localIndex === props.selectedIndex}
           widths={widths}
           config={props.config}
@@ -729,18 +804,19 @@ function MainTable(props: {
   );
 }
 
-function DataRow({row, selected, widths, config, columns}: {
+function DataRow({row, selected, widths, config, columns, failed}: {
   row: VisibleRow;
   selected: boolean;
   widths: number[];
   config: PortwardenConfig;
   columns: number;
+  failed: boolean;
 }) {
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
     const ports = [...new Set(row.members.map(({port}) => port))];
-    return <TableRow
+    return <TableRow failed={failed}
       values={[task ? 'TASK' : 'PID', row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, String(task?.root.pid ?? listener.pid), listener.elapsed,
         task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
       widths={widths} columns={columns} selected={selected} color="cyan"
@@ -749,7 +825,7 @@ function DataRow({row, selected, widths, config, columns}: {
   if (row.type === 'group') {
     const hosts = [...new Set(row.members.map(({displayHost}) => displayHost))].join(', ');
     return (
-      <TableRow
+      <TableRow failed={failed}
         values={[
           'APP',
           row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-',
@@ -769,7 +845,7 @@ function DataRow({row, selected, widths, config, columns}: {
   }
   if (row.type === 'zombie') {
     return (
-      <TableRow
+      <TableRow failed={failed}
         values={['ZOMBIE', '-', '-', String(row.zombie.pid), formatSeconds(row.zombie.ageSeconds), '-', row.zombie.family, redactCommandLine(row.zombie.command)]}
         widths={widths}
         columns={columns}
@@ -780,7 +856,7 @@ function DataRow({row, selected, widths, config, columns}: {
   }
   if (row.type === 'browser') {
     const browser = row.browser;
-    return <TableRow
+    return <TableRow failed={failed}
       values={['BROWSER', '-', '-', String(browser.pid), formatSeconds(browser.ageSeconds), formatMemory(browser.memoryBytes), browser.family,
         `${formatMemory(browser.memoryBytes)} · ${browser.members.length} procs · ${browser.name}`]}
       widths={widths} columns={columns} selected={selected} color="magenta"
@@ -788,7 +864,7 @@ function DataRow({row, selected, widths, config, columns}: {
   }
   const pinned = listenerIsPinned(row.listener, config.pinnedListenerKeys);
   return (
-    <TableRow
+    <TableRow failed={failed}
       values={[
         row.depth ? '' : row.listener.kind.toUpperCase(),
         pinned ? 'Y' : '-',
@@ -807,20 +883,21 @@ function DataRow({row, selected, widths, config, columns}: {
   );
 }
 
-function TableRow({values, widths, columns, selected = false, header = false, color}: {
+function TableRow({values, widths, columns, selected = false, header = false, color, failed = false}: {
   values: readonly string[];
   widths: readonly number[];
   columns: number;
   selected?: boolean;
   header?: boolean;
   color?: string;
+  failed?: boolean;
 }) {
   const cells = values.flatMap((value, index) => {
     const width = widths[index] ?? 0;
-    return width > 0 ? [padDisplayText(sanitizeText(value), width)] : [];
+    return width > 0 ? [padDisplayText(sanitizeText(failed && index === 7 ? `FAILED · ${value}` : value), width)] : [];
   });
   const line = truncateDisplayText(`${selected ? '>' : ' '} ${cells.join(' ')}`, columns);
-  return <Text bold={header} dimColor={header} inverse={selected} color={color}>{line}</Text>;
+  return <Text bold={header} dimColor={header} inverse={selected} color={failed ? 'red' : color}>{line}</Text>;
 }
 
 function Details({row, config, columns, listeners}: {

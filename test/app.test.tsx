@@ -77,6 +77,8 @@ describe('PortwardenApp', () => {
   });
 
   it('allows retry and force-stop on the same target after a failure without masking the original error', async () => {
+    scanner.listeners = scanner.listeners.slice(0, 1);
+    scanner.allListeners = scanner.listeners;
     const stopListener = vi.fn(async () => { throw new Error('Helper identity could not be verified.'); });
     const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
     await update();
@@ -171,7 +173,7 @@ describe('PortwardenApp', () => {
     expect(app.lastFrame()).not.toContain('Choose a target with');
   });
 
-  it('ignores duplicate stop inputs only while an action is in flight, including before the busy render', async () => {
+  it('hides stops immediately and queues the next target while rejecting duplicate input before rendering', async () => {
     const pending = deferred<{message: string}>();
     const repo = repository();
     const stopListener = vi.fn(() => pending.promise);
@@ -183,21 +185,63 @@ describe('PortwardenApp', () => {
     app.stdin.write('f');
     await update();
     expect(stopListener).toHaveBeenCalledTimes(1);
-
-    scanner.listeners = scanner.listeners.slice(1);
-    scanner.allListeners = scanner.listeners;
-    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
-    await update();
+    expect(app.lastFrame()).not.toContain('alpha');
+    expect(app.lastFrame()).toContain('port 3002');
+    expect(app.lastFrame()).toContain('Stopping 1 item(s)');
     app.stdin.write('x');
     await update();
     expect(stopListener).toHaveBeenCalledTimes(1);
+    expect(app.lastFrame()).not.toContain('bravo');
+    expect(app.lastFrame()).toContain('port 3003');
+    expect(app.lastFrame()).toContain('Stopping 2 item(s)');
 
     pending.resolve({message: 'Stopped.'});
     await update();
-    app.stdin.write('x');
-    await update();
     expect(stopListener).toHaveBeenCalledTimes(2);
-    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGTERM');
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[1], 'SIGTERM');
+    expect(app.lastFrame()).not.toContain('alpha');
+    expect(app.lastFrame()).not.toContain('bravo');
+  });
+
+  it('restores a failed stop at the bottom without stealing selection, and allows retry', async () => {
+    const pending = deferred<{message: string}>();
+    const stopListener = vi.fn(async () => { await pending.promise; throw new Error('Stop denied.'); });
+    const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    app.stdin.write('x'); await update();
+    expect(app.lastFrame()).not.toContain('alpha');
+    pending.resolve({message: ''}); await update();
+    const frame = app.lastFrame()!;
+    expect(frame.indexOf('alpha')).toBeGreaterThan(frame.indexOf('charlie'));
+    expect(frame).toContain('FAILED');
+    expect(frame).toContain('Stop denied.');
+    expect(frame).toContain('port 3002');
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('f'); await update();
+    expect(stopListener).toHaveBeenLastCalledWith(scanner.listeners[0], 'SIGKILL');
+  });
+
+  it('hides an entire expanded process scope and leaves a reused PID visible', async () => {
+    const oldStart = new Date('2026-01-01');
+    scanner.listeners = [listener({pid: 101, port: 3001, startTime: oldStart}), listener({pid: 101, port: 3002, startTime: oldStart}), listener({pid: 103, port: 3003})];
+    scanner.allListeners = scanner.listeners;
+    const pending = deferred<{message: string}>();
+    const repo = repository();
+    const actions = {stopListener: vi.fn(() => pending.promise)} as unknown as PortwardenActions;
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions} />);
+    await update();
+    app.stdin.write('\r'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('x'); await update();
+    expect(app.lastFrame()).not.toContain('3001');
+    expect(app.lastFrame()).not.toContain('3002');
+    expect(app.lastFrame()).toContain('port 3003');
+    scanner.listeners = [listener({pid: 101, port: 3001, startTime: new Date('2026-01-02'), displayProject: 'restarted'})];
+    scanner.allListeners = scanner.listeners;
+    app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions} />); await update();
+    expect(app.lastFrame()).toContain('restarted');
+    pending.resolve({message: 'Stopped.'}); await update();
   });
 
   it('stops the next browser session at the same cursor position with another x', async () => {
