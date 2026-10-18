@@ -1,7 +1,7 @@
 import Table from 'cli-table3';
 
 import {redactCommandLine, sanitizeText} from './core/commands.js';
-import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
+import type {BrowserSession, CuaConnection, ListenerEntry, ZombieCandidate} from './core/types.js';
 import {formatMemory} from './core/browserSessions.js';
 
 export interface OutputOptions {
@@ -12,6 +12,7 @@ export interface OutputOptions {
   terminalWidth?: number;
   watchSeconds?: number;
   allListeners?: readonly ListenerEntry[];
+  cua?: readonly CuaConnection[];
 }
 
 export interface ReapResult {
@@ -42,11 +43,16 @@ export function renderOutput(
       } : {pid: entry.pid, ports: scopePorts(entry.pid)}})),
       ...zombies.map(zombieToJson),
       ...browsers.map(browserToJson),
+      ...(options.cua ?? []).map((entry) => ({type: 'cua', agent: entry.agent, provider: entry.provider, label: entry.label,
+        pid: entry.pid, ppid: entry.ppid, sessionId: entry.sessionId, cwd: sanitizeText(entry.cwd),
+        ageSeconds: entry.ageSeconds, memoryBytes: entry.memoryBytes, sockets: entry.sockets.map(sanitizeText),
+        tabOwnership: entry.tabOwnership, transportState: entry.transportState, lastCall: entry.lastCall, canStop: entry.canStop,
+        memberPids: entry.members.map(({pid}) => pid), command: redactCommandLine(entry.command)})),
     ];
     return options.jsonLines ? JSON.stringify(entries) : JSON.stringify(entries, null, 2);
   }
 
-  const shown = listeners.length + zombies.length + browsers.length;
+  const shown = listeners.length + zombies.length + browsers.length + (options.cua?.length ?? 0);
   const hidden = Math.max(0, allListenerCount - listeners.length);
   const lines = [
     `${options.all ? 'All LISTEN ports' : 'Relevant + pinned ports'}: ${listeners.length}${zombies.length ? ` · zombies: ${zombies.length}` : ''}`,
@@ -59,6 +65,14 @@ export function renderOutput(
     lines.push(`Refresh interval: ${options.watchSeconds}s`);
   }
   lines.push('');
+  if (options.cua?.length) {
+    lines.push(`CUA connections: ${options.cua.length}`, '  PID      AGENT    PARENT   WORKING DIRECTORY / CONNECTION');
+    for (const entry of options.cua) {
+      lines.push(`  ${String(entry.pid).padEnd(8)} ${entry.agent.padEnd(8)} ${String(entry.ppid).padEnd(8)} [${entry.transportState}] ${sanitizeText(entry.cwd) || entry.label}${entry.canStop ? '' : ' (shared; read-only)'}`);
+      if (entry.sessionId) lines.push(`           session ${entry.sessionId}`);
+    }
+    lines.push('Tab ownership: unknown. Stop a single connection: portwarden --kill-cua <PID>', '');
+  }
 
   if (shown === 0) {
     lines.push(options.all ? 'No LISTEN ports found.' : 'No relevant or pinned LISTEN ports found.');

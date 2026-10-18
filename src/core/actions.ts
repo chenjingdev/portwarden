@@ -23,7 +23,9 @@ import {
   preferenceKey,
   selectionKey,
 } from './listeners.js';
-import type {BrowserSession, ListenerEntry, ProcessInfo, ProcessTask, ZombieCandidate} from './types.js';
+import type {BrowserSession, CuaConnection, ListenerEntry, ProcessInfo, ProcessTask, ZombieCandidate} from './types.js';
+import {detectCuaConnections} from './cuaConnections.js';
+import {releaseCuaTabs, type CuaReleaseResult} from './cuaRelease.js';
 import {sameTaskSnapshot} from './processTasks.js';
 import {detectBrowserSessions, sameBrowserProcess} from './browserSessions.js';
 import {collectProcesses, revalidateZombie, waitForZombieExit} from './zombies.js';
@@ -39,6 +41,7 @@ export interface ActionOutcome {
   pgid?: number;
   logPath?: string;
   graveyardSaved?: boolean;
+  cuaCleanup?: CuaReleaseResult;
 }
 
 export interface ActionDependencies {
@@ -51,6 +54,7 @@ export interface ActionDependencies {
   collectProcessMetadata?: typeof collectProcessMetadata;
   revalidateZombie?: typeof revalidateZombie;
   waitForZombieExit?: typeof waitForZombieExit;
+  releaseCuaTabs?: typeof releaseCuaTabs;
 }
 
 /** Match the observed task tree, falling back to one PID for standalone apps.
@@ -87,6 +91,7 @@ export class PortwardenActions {
   private readonly processMetadataProvider: typeof collectProcessMetadata;
   private readonly revalidateZombie: typeof revalidateZombie;
   private readonly waitForZombieExit: typeof waitForZombieExit;
+  private readonly releaseCuaTabs: typeof releaseCuaTabs;
 
   constructor(
     private readonly configRepository: ConfigRepository,
@@ -101,6 +106,7 @@ export class PortwardenActions {
     this.processMetadataProvider = dependencies.collectProcessMetadata ?? collectProcessMetadata;
     this.revalidateZombie = dependencies.revalidateZombie ?? revalidateZombie;
     this.waitForZombieExit = dependencies.waitForZombieExit ?? waitForZombieExit;
+    this.releaseCuaTabs = dependencies.releaseCuaTabs ?? releaseCuaTabs;
   }
 
   /** Revalidate a listener without changing process or config state. */
@@ -339,6 +345,113 @@ export class PortwardenActions {
       message: `Stopped zombie PID ${candidate.pid} (${signal}).`,
       pid: candidate.pid,
     };
+  }
+
+  async stopCua(candidate: CuaConnection, signal: StopSignal): Promise<ActionOutcome> {
+    if (!candidate.canStop) throw new ActionError('Shared CUA transport serves multiple sessions. Select a Codex or Claude connection instead.', 'UNSAFE_COMMAND');
+    const read = async () => {
+      const entries = await this.processProvider();
+      const metadata = await this.processMetadataProvider(entries.filter(({pid, executable}) => !executable && candidate.members.some((member) => member.pid === pid)).map(({pid}) => pid), {strict: true});
+      return entries.map((entry) => ({...entry, executable: entry.executable || metadata.get(entry.pid)?.executable || ''}));
+    };
+    const current = detectCuaConnections(await read()).find(({pid}) => pid === candidate.pid);
+    const unchanged = (entry: CuaConnection | undefined) => entry?.canStop && entry.ppid === candidate.ppid && entry.provider === candidate.provider &&
+      entry.members.length === candidate.members.length && entry.members.every((member) => candidate.members.some((expected) => expected.pid === member.pid && sameBrowserProcess(member, expected)));
+    if (!unchanged(current)) throw new ActionError('CUA connection changed or has incomplete identity data. Refresh before stopping.', 'STALE_PROCESS');
+    const members = new Map(candidate.members.map((entry) => [entry.pid, entry]));
+    const listeners = await this.collect({strict: true, includeTasks: false});
+    const pins = this.configRepository.get().pinnedListenerKeys;
+    if (listeners.some((entry) => members.has(entry.pid) && listenerKeys(entry).some((key) => pins.includes(key)))) {
+      throw new ActionError('CUA connection contains a pinned listener. Unpin it before stopping.', 'PINNED');
+    }
+    const processes = await read();
+    const ancestors = new Set<number>();
+    const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
+    let pid: number | undefined = process.pid;
+    while (pid && !ancestors.has(pid)) {ancestors.add(pid); pid = byPid.get(pid)?.ppid;}
+    if (candidate.members.some((entry) => ancestors.has(entry.pid)) || !unchanged(detectCuaConnections(processes).find((entry) => entry.pid === candidate.pid))) {
+      throw new ActionError('CUA scope changed or includes Portwarden. Nothing was stopped.', 'STALE_PROCESS');
+    }
+    // Cleanup uses the selected runtime's own observed context, even for force-stop.
+    // Never infer ownership from cwd or ask another session to release these tabs.
+    const cleanup = await this.releaseCuaTabs(candidate).catch(() => ({released: false, reason: 'cleanup_not_confirmed'}));
+    const afterCleanup = await read();
+    if (!unchanged(detectCuaConnections(afterCleanup).find(entry => entry.pid === candidate.pid))) {
+      throw new ActionError('CUA connection changed during tab cleanup. Refresh before stopping.', 'STALE_PROCESS');
+    }
+    try {
+      // A cooperative relay is already quiescent. Let it close its native child
+      // before escalating, avoiding a parent-kill race with exiting descendants.
+      if (cleanup.released && signal === 'SIGKILL') {
+        this.kill(candidate.pid, 'SIGTERM');
+        const deadline = Date.now() + 2000;
+        do {
+          const remaining = (await this.processProvider()).filter(entry => members.has(entry.pid));
+          if (!remaining.length) return {message: `Stopped ${candidate.agent} CUA process PID ${candidate.pid}. Original turn cleanup confirmed before stopping.`, pid: candidate.pid, cuaCleanup: cleanup};
+          if (Date.now() >= deadline) break;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        } while (true);
+      }
+      // SIGTERM permits the runtime's own shutdown handlers, if any. Process exit
+      // does not prove that the browser received turn cleanup or released tab leases.
+      // Force-stop is restricted to this observed subtree, never the parent agent or shared helpers.
+      for (const member of signal === 'SIGTERM' ? [candidate] : candidate.members) {
+        const fresh = (await read()).find((entry) => entry.pid === member.pid);
+        if (!fresh) continue;
+        if (!sameBrowserProcess(fresh, member)) throw new Error(`CUA PID ${member.pid} changed before signaling.`);
+        try {this.kill(member.pid, signal);} catch (error) {if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;}
+      }
+      const deadline = Date.now() + (signal === 'SIGKILL' ? 1_000 : 5_000);
+      do {
+        const remaining = (await this.processProvider()).filter((entry) => members.has(entry.pid) && (!entry.startTime || entry.startTime.getTime() === members.get(entry.pid)?.startTime?.getTime()));
+        if (!remaining.length) return {message: `Stopped ${candidate.agent} CUA process PID ${candidate.pid}. ${cleanup.released ? 'Original turn cleanup confirmed before stopping.' : 'Browser tab cleanup was not confirmed and ownership may remain.'} The agent's MCP connection may require a restart.`, pid: candidate.pid, cuaCleanup: cleanup};
+        if (Date.now() >= deadline) throw new Error(`${remaining.length} CUA process(es) remain. Refresh or force-stop this connection.`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } while (true);
+    } catch (error) {throw new ActionError(sanitizeText(error instanceof Error ? error.message : error), 'STOP_FAILED');}
+  }
+
+  async stopCuaGroup(candidates: readonly CuaConnection[], signal: StopSignal, onProgress?: (message: string) => void): Promise<ActionOutcome> {
+    const targets = [...new Map(candidates.map((entry) => [entry.pid, entry])).values()];
+    if (!targets.length || targets.some((entry) => !entry.canStop)) {
+      throw new ActionError('Select agent CUA connections only. Shared services cannot be bulk-stopped.', 'UNSAFE_COMMAND');
+    }
+    // Preflight the entire observed selection before the first signal. New connections
+    // created after selection are never added to this stop scope.
+    const entries = await this.processProvider();
+    const targetPids = new Set(targets.flatMap(({members}) => members.map(({pid}) => pid)));
+    const metadata = await this.processMetadataProvider(entries.filter((entry) => targetPids.has(entry.pid) && !entry.executable).map(({pid}) => pid), {strict: true});
+    const processes = entries.map((entry) => ({...entry, executable: entry.executable || metadata.get(entry.pid)?.executable || ''}));
+    const current = detectCuaConnections(processes);
+    for (const target of targets) {
+      const fresh = current.find((entry) => entry.pid === target.pid);
+      if (!fresh?.canStop || fresh.ppid !== target.ppid || fresh.members.length !== target.members.length ||
+          fresh.members.some((member) => !target.members.some((expected) => sameBrowserProcess(member, expected)))) {
+        throw new ActionError(`CUA group changed at PID ${target.pid}. Refresh before stopping; nothing was stopped.`, 'STALE_PROCESS');
+      }
+    }
+    const byPid = new Map(processes.map((entry) => [entry.pid, entry]));
+    const ancestors = new Set<number>();
+    let ancestor: number | undefined = process.pid;
+    while (ancestor && !ancestors.has(ancestor)) {ancestors.add(ancestor); ancestor = byPid.get(ancestor)?.ppid;}
+    if ([...targetPids].some((pid) => ancestors.has(pid))) throw new ActionError('CUA group contains Portwarden; nothing was stopped.', 'STALE_PROCESS');
+    const pins = this.configRepository.get().pinnedListenerKeys;
+    if ((await this.collect({strict: true, includeTasks: false})).some((entry) => targetPids.has(entry.pid) && listenerKeys(entry).some((key) => pins.includes(key)))) {
+      throw new ActionError('CUA group contains a pinned listener; nothing was stopped.', 'PINNED');
+    }
+    let stopped = 0;
+    let released = 0;
+    const failures: string[] = [];
+    for (const target of targets) {
+      onProgress?.(`Stopping CUA process ${stopped + failures.length + 1}/${targets.length} · PID ${target.pid}`);
+      // Stopping a host frontend may also unload its owned CUA runtime. Never
+      // signal a reused PID, and do not report an already-gone dependent as a failure.
+      if (!(await this.processProvider()).some(entry => entry.pid === target.pid)) {stopped++; continue;}
+      try {const result = await this.stopCua(target, signal); stopped++; if (result.cuaCleanup?.released) released++;}
+      catch (error) {failures.push(`PID ${target.pid}: ${sanitizeText(error instanceof Error ? error.message : error)}`);}
+    }
+    return {message: `Stopped ${stopped}/${targets.length} CUA processes. Original turn cleanup confirmed for ${released}/${stopped}${released < stopped ? '; other tab ownership remains unverified' : ''}. Parent agents and shared services remain running.`,
+      ...(failures.length ? {warning: `${failures.length} connection(s) failed: ${failures.join('; ')}`} : {})};
   }
 
   async moveListener(entry: ListenerEntry): Promise<ActionOutcome> {

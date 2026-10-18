@@ -287,6 +287,43 @@ describe('PortwardenApp', () => {
     expect(app.lastFrame()).toContain('Stop PID 101, ports 3001, 4500?');
   });
 
+  it('collapses separately started servers from one project folder and stops only a process chosen inside', async () => {
+    const root = '/tmp/dev/honcho';
+    const dashboard = listener({pid: 201, port: 4173, projectRoot: root, displayProject: 'honcho', displayCommand: 'node local-dashboard/server.mjs'});
+    const bridge = listener({pid: 202, port: 8766, projectRoot: root, displayProject: 'honcho', displayCommand: 'python local-mcp-bridge/server.py'});
+    scanner.listeners = [dashboard, bridge, listener({pid: 103, port: 3003, displayProject: 'charlie'})];
+    scanner.allListeners = scanner.listeners;
+    const stopListener = vi.fn(async () => ({message: 'Stopped.'}));
+    const repo = repository(); repo.update({confirmActions: true});
+    const app = render(<PortwardenApp configRepository={repo} actionsOverride={{stopListener} as unknown as PortwardenActions} />);
+    await update();
+    expect(app.lastFrame()).toContain('> honcho');
+    expect(app.lastFrame()).toContain('ports 4173, 8766 · 2 processes');
+    expect(app.lastFrame()).toContain('project honcho  dir /tmp/dev/honcho  2 processes started separately');
+    expect(app.lastFrame()).not.toContain('| honcho');
+    app.stdin.write('x'); await update();
+    expect(app.lastFrame()).toContain('Expand the group and select one process first.');
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual([listenerKey(dashboard), listenerKey(bridge)]);
+    app.stdin.write('p'); await update();
+    expect(repo.get().pinnedListenerKeys).toEqual([]);
+    app.stdin.write('\r'); await update();
+    expect(app.lastFrame()).toContain('v honcho');
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('\u001B[D'); await update();
+    expect(app.lastFrame()).toContain('Collapsed group: honcho.');
+    expect(app.lastFrame()).not.toContain('| honcho');
+    app.stdin.write('\u001B[C'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('\u001B[B'); await update();
+    app.stdin.write('x'); await update();
+    expect(app.lastFrame()).toContain('Stop port 8766 (PID 202, honcho)?');
+    app.stdin.write('\r'); await update();
+    expect(stopListener).toHaveBeenCalledTimes(1);
+    expect(stopListener).toHaveBeenCalledWith(bridge, 'SIGTERM');
+  });
+
   it('navigates the primary screens and treats pasted chunks as text, not actions', async () => {
     const app = render(<PortwardenApp configRepository={repository()} />);
     await update();

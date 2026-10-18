@@ -10,12 +10,14 @@ import {ConfigRepository} from './config.js';
 import {formatActionOutcomes, stopListenerMatches} from './cliActions.js';
 import {PortwardenActions, type ActionOutcome, type StopSignal} from './core/actions.js';
 import {collectListeners, selectListeners} from './core/listeners.js';
-import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
+import type {BrowserSession, CuaConnection, ListenerEntry, ZombieCandidate} from './core/types.js';
+import {collectCuaConnections, detectCuaConnections} from './core/cuaConnections.js';
 import {detectBrowserSessions} from './core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates, reapZombie} from './core/zombies.js';
 import {renderOutput, renderReapResults, type ReapResult} from './output.js';
 import {PortwardenApp} from './tui/App.js';
 import {startDiagnostics} from './diagnostics.js';
+import {setupCuaRelease} from './core/setupCuaRelease.js';
 
 let diagnostics: ReturnType<typeof startDiagnostics> | undefined;
 
@@ -36,6 +38,10 @@ interface CliOptions {
   nextPort?: number;
   killPort?: number;
   killPid?: number;
+  killCua?: number;
+  killCuaGroup?: 'all' | 'codex' | 'claude';
+  setupCuaRelease?: boolean;
+  removeCuaRelease?: boolean;
 }
 
 const program = new Command()
@@ -52,11 +58,15 @@ const program = new Command()
   .option('--reap', 'stop reapable orphaned browser-automation processes', false)
   .option('--dry-run', 'preview --reap without sending a signal', false)
   .option('-f, --force', 'use SIGKILL with --kill-* or --reap', false)
+  .option('--setup-cua-release', 'install cooperative CUA tab cleanup before process stop')
+  .option('--remove-cua-release', 'remove only the Portwarden CUA configuration override')
   .addOption(new Option('-w, --watch [seconds]', 'refresh plain/JSON output continuously').argParser(parsePositiveNumber).default(false))
   .addOption(new Option('-b, --browser <name>', 'browser application used by the TUI').argParser(parseNonEmpty))
   .addOption(new Option('--next-port <port>', 'print the next actually available port').argParser(parsePort))
   .addOption(new Option('--kill-port <port>', 'stop the displayed task owning a port (including its launcher and workers)').argParser(parsePort))
   .addOption(new Option('--kill-pid <pid>', 'stop the displayed dev task, browser tree, or standalone PID').argParser(parsePositiveInteger))
+  .addOption(new Option('--kill-cua <pid>', 'stop only one CUA connection and its helpers; keep the parent agent running').argParser(parsePositiveInteger))
+  .addOption(new Option('--kill-cua-group <group>', 'stop observed CUA connections in all, codex, or claude; keep shared services').choices(['all', 'codex', 'claude']))
   .addHelpText('after', `
 Examples:
   $ portwarden
@@ -74,8 +84,12 @@ async function main(): Promise<void> {
   await program.parseAsync(process.argv);
   const options = program.opts<CliOptions>();
   validateOptions(options);
+  if (options.setupCuaRelease || options.removeCuaRelease) {
+    console.log(await setupCuaRelease({remove: options.removeCuaRelease}));
+    return;
+  }
 
-  const hasHeadlessAction = options.nextPort !== undefined || options.killPort !== undefined || options.killPid !== undefined || options.reap;
+  const hasHeadlessAction = options.nextPort !== undefined || options.killPort !== undefined || options.killPid !== undefined || options.killCua !== undefined || options.killCuaGroup !== undefined || options.reap;
   const watchSeconds = options.watch === true ? 2 : typeof options.watch === 'number' ? options.watch : 0;
   const defaultTui = process.stdin.isTTY && process.stdout.isTTY && !options.plain && !options.json && watchSeconds === 0 && !hasHeadlessAction;
 
@@ -100,7 +114,7 @@ async function main(): Promise<void> {
   }
 
   const actions = new PortwardenActions(configRepository);
-  if (options.killPort !== undefined || options.killPid !== undefined) {
+  if (options.killPort !== undefined || options.killPid !== undefined || options.killCua !== undefined || options.killCuaGroup !== undefined) {
     await runDirectKill(actions, options);
     return;
   }
@@ -111,13 +125,13 @@ async function main(): Promise<void> {
   }
 
   const snapshot = await scan(configRepository, options);
-  console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, {...options, allListeners: snapshot.allListeners}, snapshot.browsers));
+  console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, {...options, allListeners: snapshot.allListeners, cua: snapshot.cua}, snapshot.browsers));
 }
 
 async function scan(
   configRepository: ConfigRepository,
   options: Pick<CliOptions, 'all' | 'json' | 'zombies'>,
-): Promise<{allListeners: ListenerEntry[]; listeners: ListenerEntry[]; zombies: ZombieCandidate[]; browsers: BrowserSession[]}> {
+): Promise<{allListeners: ListenerEntry[]; listeners: ListenerEntry[]; zombies: ZombieCandidate[]; browsers: BrowserSession[]; cua: CuaConnection[]}> {
   const processPromise = collectProcesses();
   const listenerPromise = collectListeners({strict: true, processProvider: () => processPromise});
   const [processes, allListeners] = await Promise.all([processPromise, listenerPromise]);
@@ -125,6 +139,7 @@ async function scan(
   const taskPids = new Set(allListeners.flatMap(({task}) => task?.members.map(({pid}) => pid) ?? []));
   return {
     allListeners,
+    cua: await collectCuaConnections(processes),
     browsers: detectBrowserSessions(processes).filter(({pid}) => !taskPids.has(pid)),
     listeners: selectListeners(allListeners, {
       all: options.all,
@@ -142,6 +157,27 @@ async function runDirectKill(actions: PortwardenActions, options: CliOptions): P
   const processPromise = collectProcesses();
   const allListeners = await collectListeners({strict: true, processProvider: () => processPromise});
   const processes = await processPromise;
+
+  if (options.killCuaGroup !== undefined) {
+    const targets = (await collectCuaConnections(processes)).filter((entry) => entry.canStop &&
+      (options.killCuaGroup === 'all' || entry.agent.toLowerCase() === options.killCuaGroup));
+    if (!targets.length) throw new Error('No matching CUA connections found.');
+    const result = await actions.stopCuaGroup(targets, signal);
+    printActionOutcome(result);
+    if (result.warning) process.exitCode = 1;
+    return;
+  }
+
+  if (options.killCua !== undefined) {
+    const connection = (await collectCuaConnections(processes)).find(({pid}) => pid === options.killCua);
+    if (!connection) throw new Error(`PID ${options.killCua} is not a current CUA connection.`);
+    printActionOutcome(await actions.stopCua(connection, signal));
+    return;
+  }
+  // --kill-pid must not widen a CUA bridge selection to its whole parent task.
+  if (options.killPid !== undefined && detectCuaConnections(processes).some(({pid}) => pid === options.killPid)) {
+    throw new Error('Use --kill-cua <PID> to stop a CUA connection without stopping its parent agent.');
+  }
 
   if (options.killPort !== undefined) {
     const rawMatches = allListeners.filter(({port}) => port === options.killPort);
@@ -222,6 +258,7 @@ async function runWatch(configRepository: ConfigRepository, options: CliOptions,
       console.log(renderOutput(snapshot.listeners, snapshot.allListeners.length, snapshot.zombies, {
         ...options,
         allListeners: snapshot.allListeners,
+        cua: snapshot.cua,
         jsonLines: options.json,
         watchSeconds: seconds,
       }, snapshot.browsers));
@@ -278,9 +315,9 @@ async function runTui(configRepository: ConfigRepository, options: CliOptions): 
 }
 
 function validateOptions(options: CliOptions): void {
-  const operationCount = [options.nextPort !== undefined, options.killPort !== undefined, options.killPid !== undefined, options.reap]
+  const operationCount = [options.nextPort !== undefined, options.killPort !== undefined, options.killPid !== undefined, options.killCua !== undefined, options.killCuaGroup !== undefined, options.reap, options.setupCuaRelease, options.removeCuaRelease]
     .filter(Boolean).length;
-  if (operationCount > 1) throw new Error('Choose only one of --next-port, --kill-port, --kill-pid, or --reap.');
+  if (operationCount > 1) throw new Error('Choose only one of --next-port, --kill-port, --kill-pid, --kill-cua, --kill-cua-group, or --reap.');
   if (operationCount > 0 && (options.all || options.json || options.plain || options.tui || options.zombies || options.watch || options.browser)) {
     throw new Error('Headless actions cannot be combined with display, watch, zombie-listing, browser, or TUI options.');
   }
@@ -289,8 +326,8 @@ function validateOptions(options: CliOptions): void {
   }
   if (options.plain && options.json) throw new Error('--plain and --json cannot be combined.');
   if (options.dryRun && !options.reap) throw new Error('--dry-run requires --reap.');
-  if (options.force && options.killPort === undefined && options.killPid === undefined && !options.reap) {
-    throw new Error('--force requires --kill-port, --kill-pid, or --reap.');
+  if (options.force && options.killPort === undefined && options.killPid === undefined && options.killCua === undefined && options.killCuaGroup === undefined && !options.reap) {
+    throw new Error('--force requires --kill-port, --kill-pid, --kill-cua, --kill-cua-group, or --reap.');
   }
 }
 

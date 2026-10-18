@@ -5,8 +5,10 @@ import {
   classifyListener,
   collapseEquivalentListeners,
   collectListeners,
+  enrichListener,
   getEntryPreferenceKey,
   getProjectName,
+  getProjectRoot,
   listenerKey,
   matchesKeyword,
   parseEndpoint,
@@ -352,6 +354,30 @@ describe('classification and identity', () => {
       args: 'node /Users/test/Library/Caches/pnpm/dlx/hash/node_modules/.pnpm/@playwright+mcp@0.0.70/node_modules/@playwright/mcp/cli.js --port 53188',
       home: '/Users/test',
     })).toBe('@playwright/mcp');
+  });
+
+  it('records the folder a project name comes from so separate servers in it can share a row', () => {
+    const home = '/Users/test';
+    for (const [cwd, root] of [
+      ['/Users/test/dev/honcho/local-dashboard', '/Users/test/dev/honcho'],
+      ['/Users/test/dev/honcho/local-mcp-bridge/', '/Users/test/dev/honcho'],
+      ['/Users/test/.honcho-infra/honcho-external-api-proxy', '/Users/test/.honcho-infra'],
+      ['/srv/api', '/srv/api'],
+    ]) {
+      expect(getProjectRoot({cwd, home})).toBe(root);
+      expect(getProjectName({cwd, home})).toBe(root!.split('/').at(-1));
+    }
+    // A name inferred from the command line has no folder to group by.
+    for (const cwd of ['', '/', home, '/Users/test/dev', '/usr/local']) {
+      expect(getProjectRoot({cwd, home})).toBe('');
+    }
+    expect(enrichListener(
+      {pid: 2012, command: 'python3.12', endpoint: '127.0.0.1:8766'},
+      {host: '127.0.0.1', port: 8766},
+      undefined,
+      '/Users/test/dev/honcho/local-mcp-bridge',
+      {home},
+    )).toMatchObject({projectName: 'honcho', projectRoot: '/Users/test/dev/honcho'});
   });
 });
 

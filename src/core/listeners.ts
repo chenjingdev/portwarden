@@ -115,6 +115,8 @@ export interface ListenerCommandRunner {
 }
 
 export interface CollectListenersOptions {
+  /** Port-only checks do not need unrelated launcher/worker tree metadata. */
+  includeTasks?: boolean;
   /** Throw on discovery failures. Display callers may opt into an empty/degraded result instead. */
   strict?: boolean;
   signal?: AbortSignal;
@@ -455,7 +457,9 @@ export async function collectListeners(options: CollectListenersOptions = {}): P
     ];
   });
 
-  return attachProcessTasks(sortListeners(collapseEquivalentListeners(enriched)), processes,
+  const sorted = sortListeners(collapseEquivalentListeners(enriched));
+  if (options.includeTasks === false) return sorted;
+  return attachProcessTasks(sorted, processes,
     (pids) => collectProcessMetadata(pids, options));
 }
 
@@ -472,6 +476,7 @@ export function enrichListener(
   const executable = processInfo?.executable ?? '';
   const appFamily = inferAppFamily({cwd, command, args, executable});
   const projectName = getProjectName({cwd, command, args, home});
+  const projectRoot = getProjectRoot({cwd, home});
   const startTime = processInfo?.startTime;
   const ageMs = processInfo?.ageMs ?? (
     startTime ? Math.max(0, (options.now ?? new Date()).getTime() - startTime.getTime()) : undefined
@@ -494,6 +499,7 @@ export function enrichListener(
     kind: classifyListener(details),
     appFamily,
     projectName,
+    ...(projectRoot ? {projectRoot} : {}),
     displayProject: projectName || appFamily,
     displayCommand: summarizeCommand(command, args, home),
     displayCwd: formatDisplayCwd(cwd, args, home),
@@ -595,6 +601,21 @@ export function getProjectName(details: ListenerDetails): string {
 
   const basename = path.basename(cwd);
   return isGenericProjectDir(basename) ? inferProjectNameFromCommand(details) || basename : basename;
+}
+
+/** The folder `getProjectName` takes its name from, or '' when the name comes from the command line. */
+export function getProjectRoot(details: Pick<ListenerDetails, 'cwd' | 'home'>): string {
+  const home = details.home ?? homedir();
+  const cwd = details.cwd?.trim().replace(/[\\/]+$/, '') ?? '';
+  if (!cwd || cwd === path.parse(cwd).root || cwd === home) return '';
+
+  if (cwd.startsWith(`${home}${path.sep}`)) {
+    const segments = path.relative(home, cwd).split(path.sep).filter(Boolean);
+    const depth = PROJECT_ROOT_HINTS.has((segments[0] ?? '').toLowerCase()) ? 2 : 1;
+    return segments.length >= depth ? path.join(home, ...segments.slice(0, depth)) : '';
+  }
+
+  return isGenericProjectDir(path.basename(cwd)) ? '' : cwd;
 }
 
 export function inferProjectNameFromCommand(details: Pick<ListenerDetails, 'command' | 'args'>): string {

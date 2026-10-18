@@ -28,6 +28,23 @@ export interface BrowserSession extends ProcessInfo {
   reason: string;
 }
 
+/** A portless computer-use connection, or a shared transport shown for context. */
+export interface CuaConnection extends ProcessInfo {
+  agent: 'Codex' | 'Claude' | 'Shared';
+  provider: 'codex-cua' | 'cmux-cua' | 'chrome-extension' | 'macos-service';
+  label: string;
+  members: ProcessInfo[];
+  memoryBytes: number | null;
+  ageSeconds: number | null;
+  sessionId?: string;
+  lastCall?: string;
+  sockets: string[];
+  transportState: 'connected' | 'not-observed' | 'unknown' | 'shared';
+  /** Process existence and a socket are not evidence of a browser tab lease. */
+  tabOwnership: 'unknown';
+  canStop: boolean;
+}
+
 export interface RawListener {
   pid: number;
   command: string;
@@ -69,6 +86,8 @@ export interface ListenerEntry {
   kind: ListenerKind;
   appFamily: string;
   projectName: string;
+  /** Folder that names `projectName`; absent when the name came from the command line. */
+  projectRoot?: string;
   displayProject: string;
   displayCommand: string;
   displayCwd: string;

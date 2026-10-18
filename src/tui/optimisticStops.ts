@@ -12,6 +12,8 @@ export function processIdentity(process: {pid: number; startTime?: Date}): strin
 }
 
 export function rowIdentities(row: VisibleRow): string[] {
+  if (row.type === 'cua-group') return row.members.flatMap((entry) => entry.members.map(processIdentity));
+  if (row.type === 'cua') return row.cua.members.map(processIdentity);
   if (row.type === 'browser') return row.browser.members.map(processIdentity);
   if (row.type === 'zombie') return [processIdentity(row.zombie)];
   const listeners = row.type === 'listener' ? [row.listener] : row.members;
@@ -22,7 +24,7 @@ export function rowIdentities(row: VisibleRow): string[] {
 export function failedRowsLast(rows: VisibleRow[], failed: ReadonlySet<string>): VisibleRow[] {
   const blocks: VisibleRow[][] = [];
   for (const row of rows) {
-    if (row.type === 'listener' && row.parentGroupKey && blocks.at(-1)?.[0]?.key === row.parentGroupKey) {
+    if ((row.type === 'listener' || row.type === 'process' || row.type === 'cua' || row.type === 'cua-group') && row.parentGroupKey && blocks.at(-1)?.some((parent) => parent.key === row.parentGroupKey)) {
       blocks.at(-1)!.push(row);
     } else {
       blocks.push([row]);

@@ -37,6 +37,12 @@ describe('portwarden CLI', () => {
     const invalidCombination = await run(['--reap', '--json']);
     expect(invalidCombination.exitCode).toBe(1);
     expect(invalidCombination.stderr).toContain('Headless actions cannot be combined');
+
+    const invalidCuaGroup = await run(['--kill-cua-group', 'shared']);
+    expect(invalidCuaGroup.exitCode).toBe(1);
+    const mixedCuaAction = await run(['--kill-cua-group', 'all', '--kill-cua', '999']);
+    expect(mixedCuaAction.exitCode).toBe(1);
+    expect(mixedCuaAction.stderr).toContain('Choose only one');
   });
 
   it('finds the next port even when the unrelated config file is corrupt', async () => {

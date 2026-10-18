@@ -1,3 +1,6 @@
+import {homedir} from 'node:os';
+import path from 'node:path';
+
 import {useEffect, useMemo, useRef, useState} from 'react';
 
 import {Box, Text, useApp, useInput, useStdout} from 'ink';
@@ -13,7 +16,7 @@ import {
   type StopSignal,
 } from '../core/actions.js';
 import {listenerKey, listenerKeys, preferenceKey, selectionKey} from '../core/listeners.js';
-import type {ListenerEntry} from '../core/types.js';
+import type {CuaConnection, ListenerEntry} from '../core/types.js';
 import {formatMemory} from '../core/browserSessions.js';
 import {normalizeShortcut} from './keymap.js';
 import {buildVisibleRows, listenerIsPinned, type VisibleRow} from './rows.js';
@@ -21,6 +24,7 @@ import {useScanner} from './useScanner.js';
 import {failedRowsLast, processIdentity, rowIdentities, type StopPresentation} from './optimisticStops.js';
 
 type Screen = 'main' | 'settings' | 'browser' | 'graveyard' | 'help';
+type GroupRow = Extract<VisibleRow, {type: 'group' | 'project' | 'process' | 'cua-group'}>;
 
 interface Confirmation {
   title: string;
@@ -53,6 +57,7 @@ export function PortwardenApp({
   const [config, setConfig] = useState(() => configRepository.get());
   const [all, setAll] = useState(initialAll);
   const [showZombies, setShowZombies] = useState(initialZombies);
+  const [showCuaRuntimes, setShowCuaRuntimes] = useState(true);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set());
   const [screen, setScreen] = useState<Screen>('main');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -106,19 +111,22 @@ export function PortwardenApp({
       pinnedListenerKeys: config.pinnedListenerKeys,
       query,
       browsers: scanner.browsers?.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
+      cua: scanner.cua?.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
+      showCuaRuntimes,
       allListeners: scanner.allListeners.filter((entry) => !hiddenIdentities.has(processIdentity(entry))),
     }), failedIdentities),
-    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies, scanner.browsers, scanner.allListeners, hiddenIdentities, failedIdentities],
+    [all, config.pinnedListenerKeys, expandedGroups, query, scanner.listeners, scanner.zombies, scanner.browsers, scanner.cua, scanner.allListeners, hiddenIdentities, failedIdentities, showCuaRuntimes],
   );
   useEffect(() => {
     const live = new Set([
       ...scanner.allListeners.flatMap((entry) => (entry.task?.members ?? [entry]).map(processIdentity)),
       ...(scanner.browsers ?? []).flatMap((entry) => entry.members.map(processIdentity)),
+      ...(scanner.cua ?? []).flatMap((entry) => entry.members.map(processIdentity)),
       ...scanner.zombies.map(processIdentity),
     ]);
     const next = stopsRef.current.filter((entry) => entry.phase === 'pending' || entry.identities.some((id) => live.has(id)));
     if (next.length !== stopsRef.current.length) updateStops(next);
-  }, [scanner.allListeners, scanner.browsers, scanner.zombies]);
+  }, [scanner.allListeners, scanner.browsers, scanner.cua, scanner.zombies]);
   const selectedIndex = selectedKey ? visibleRows.findIndex(({key}) => key === selectedKey) : -1;
   const effectiveSelectedIndex = visibleRows.length === 0
     ? -1
@@ -248,7 +256,7 @@ export function PortwardenApp({
 
   const toggleSelectedPin = () => {
     pendingSelectionKey.current = null;
-    if (selectedRow?.type !== 'listener' && selectedRow?.type !== 'group' && selectedRow?.type !== 'process') {
+    if (selectedRow?.type !== 'listener' && selectedRow?.type !== 'group' && selectedRow?.type !== 'project' && selectedRow?.type !== 'process') {
       setActionError('Only LISTEN ports and their groups can be pinned.');
       return;
     }
@@ -286,7 +294,7 @@ export function PortwardenApp({
   const reorderSelected = (direction: -1 | 1) => {
     pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, direction > 0);
+      if (isGroupRow(selectedRow)) toggleGroup(selectedRow, direction > 0);
       return;
     }
     const selectedPinned = listenerIsPinned(selectedRow.listener, config.pinnedListenerKeys);
@@ -321,7 +329,7 @@ export function PortwardenApp({
     );
   };
 
-  const toggleGroup = (row: Extract<VisibleRow, {type: 'group' | 'process'}>, force?: boolean) => {
+  const toggleGroup = (row: GroupRow, force?: boolean) => {
     pendingSelectionKey.current = null;
     setExpandedGroups((current) => {
       const next = new Set(current);
@@ -332,22 +340,26 @@ export function PortwardenApp({
     });
   };
 
-  const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener'}>): boolean => {
+  const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener' | 'process' | 'cua' | 'cua-group'}>): boolean => {
     if (!row.parentGroupKey) return false;
-    const parent = visibleRows.find((candidate): candidate is Extract<VisibleRow, {type: 'group' | 'process'}> =>
-      (candidate.type === 'group' || candidate.type === 'process') && candidate.key === row.parentGroupKey,
+    const parent = visibleRows.find((candidate): candidate is GroupRow =>
+      isGroupRow(candidate) && candidate.key === row.parentGroupKey,
     );
     if (!parent) return false;
     setSelectedKey(parent.key);
     selectionIndexHint.current = visibleRows.findIndex(({key}) => key === parent.key);
     toggleGroup(parent, false);
-    setStatus(`Collapsed app group: ${parent.family}.`);
+    setStatus(`Collapsed group: ${parent.family}.`);
     return true;
   };
 
   const stopSelected = (signal: StopSignal) => {
-    if (!selectedRow || selectedRow.type === 'group') {
+    if (!selectedRow || selectedRow.type === 'group' || selectedRow.type === 'project') {
       setActionError(selectedRow ? 'Expand the group and select one process first.' : 'No process selected.');
+      return;
+    }
+    if (selectedRow.type === 'cua' && !selectedRow.cua.canStop) {
+      setActionError('Shared CUA service. Select a Codex or Claude CUA connection to stop.');
       return;
     }
     const listener = selectedRow.type === 'listener' ? selectedRow.listener
@@ -370,6 +382,10 @@ export function PortwardenApp({
       : siblingPorts.length > 0
         ? `PID ${listener.pid}, ports ${[listener, ...siblingPorts].map(({port}) => port).join(', ')}`
         : `port ${listener.port} (PID ${listener.pid}, ${listener.displayProject || listener.command})`
+      : selectedRow.type === 'cua-group'
+        ? `${selectedRow.family}: ${selectedRow.members.length} connections (including hidden members)`
+      : selectedRow.type === 'cua'
+        ? `${selectedRow.cua.agent} CUA connection PID ${selectedRow.cua.pid} (parent agent stays running)`
       : selectedRow.type === 'browser'
         ? `browser PID ${selectedRow.browser.pid} (${selectedRow.browser.members.length} processes, ${formatMemory(selectedRow.browser.memoryBytes)} RSS)`
         : selectedRow.type === 'zombie' ? `PID ${selectedRow.zombie.pid} (${selectedRow.zombie.family})` : '';
@@ -400,10 +416,13 @@ export function PortwardenApp({
         // Present immediately, but serialize destructive work and config writes.
         stopQueue.current = stopQueue.current.then(async () => {
           try {
-            const result = listener ? await actions.stopListener(listener, signal)
+            const result = selectedRow.type === 'cua-group' ? await actions.stopCuaGroup(selectedRow.members, signal, setStatus)
+              : selectedRow.type === 'cua' ? await actions.stopCua(selectedRow.cua, signal)
+              : listener ? await actions.stopListener(listener, signal)
               : selectedRow.type === 'browser' ? await actions.stopBrowser(selectedRow.browser, signal)
                 : selectedRow.type === 'zombie' ? await actions.stopZombie(selectedRow.zombie, signal) : {message: 'No process selected.'};
-            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'stopped'} : entry));
+            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry,
+              phase: selectedRow.type === 'cua-group' && result.warning ? 'failed' : 'stopped', error: result.warning} : entry));
             setStatus(result.message);
             setActionWarning(result.warning ?? '');
           } catch (error) {
@@ -578,14 +597,15 @@ export function PortwardenApp({
     } else if (key.downArrow) {
       moveMainSelection(1);
     } else if (key.leftArrow) {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, false);
-      else if (selectedRow?.type !== 'listener' || !collapseParentGroup(selectedRow)) reorderSelected(-1);
+      if ((selectedRow?.type === 'cua-group' || selectedRow?.type === 'process') && !selectedRow.expanded && selectedRow.parentGroupKey) collapseParentGroup(selectedRow);
+      else if (isGroupRow(selectedRow)) toggleGroup(selectedRow, false);
+      else if ((selectedRow?.type !== 'listener' && selectedRow?.type !== 'cua') || !collapseParentGroup(selectedRow)) reorderSelected(-1);
     } else if (key.rightArrow) {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, true);
+      if (isGroupRow(selectedRow)) toggleGroup(selectedRow, true);
       else reorderSelected(1);
-    } else if (key.return && (selectedRow?.type === 'group' || selectedRow?.type === 'process')) {
+    } else if (key.return && isGroupRow(selectedRow)) {
       toggleGroup(selectedRow);
-    } else if (key.return && selectedRow?.type === 'listener' && selectedRow.parentGroupKey) {
+    } else if (key.return && (selectedRow?.type === 'listener' || selectedRow?.type === 'cua') && selectedRow.parentGroupKey) {
       collapseParentGroup(selectedRow);
     } else if (normalized === 'q') {
       if (stopsRef.current.some(({phase}) => phase === 'pending')) {
@@ -602,6 +622,10 @@ export function PortwardenApp({
       pendingSelectionKey.current = null;
       setShowZombies((value) => !value);
       setStatus(showZombies ? 'Zombies hidden.' : 'Zombies visible.');
+    } else if (normalized === 'c') {
+      pendingSelectionKey.current = null;
+      setShowCuaRuntimes((value) => !value);
+      setStatus(showCuaRuntimes ? 'CUA runtimes with no observed connection hidden.' : 'All CUA runtimes visible. A runtime does not establish tab ownership.');
     } else if (normalized === 'p') {
       toggleSelectedPin();
     } else if (normalized === 'o') {
@@ -695,6 +719,9 @@ export function PortwardenApp({
         zombieCount={scanner.zombies.length}
         browserCount={scanner.browsers?.length ?? 0}
         browserMemory={scanner.browsers?.every(({memoryBytes}) => memoryBytes !== null) ? scanner.browsers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null}
+        cuaConnectedCount={(scanner.cua ?? []).filter((entry) => entry.canStop && entry.transportState === 'connected').length}
+        cuaRuntimeCount={(scanner.cua ?? []).filter((entry) => entry.transportState === 'not-observed').length}
+        showCuaRuntimes={showCuaRuntimes}
         selectedIndex={effectiveSelectedIndex}
         browser={normalizedBrowserOverride || config.browser}
         loading={scanner.loading}
@@ -737,6 +764,9 @@ function MainHeader(props: {
   zombieCount: number;
   browserCount: number;
   browserMemory: number | null;
+  cuaConnectedCount: number;
+  cuaRuntimeCount: number;
+  showCuaRuntimes: boolean;
   selectedIndex: number;
   browser: string;
   loading: boolean;
@@ -751,6 +781,7 @@ function MainHeader(props: {
         PORTWARDEN  <Text color={props.all ? 'cyan' : 'green'}>[{props.all ? 'ALL' : 'MAIN'}]</Text>{' '}
         <Text color="white">[{props.listenerCount} port{props.listenerCount === 1 ? '' : 's'}]</Text>{' '}
         {props.browserCount > 0 ? <Text color="magenta">[{props.browserCount} browsers · {formatMemory(props.browserMemory)} RSS] </Text> : null}
+        {props.cuaConnectedCount + props.cuaRuntimeCount > 0 ? <Text color="magenta">[CUA {props.cuaConnectedCount} connected · {props.cuaRuntimeCount} runtimes {props.showCuaRuntimes ? 'shown' : 'hidden'}] </Text> : null}
         {props.all && props.rowCount !== props.listenerCount ? <Text color="gray">[{props.rowCount} rows] </Text> : null}
         {!props.all && props.hiddenCount > 0 ? <Text color="yellow">[hidden {props.hiddenCount}] </Text> : null}
         {props.showZombies ? <Text color={props.zombieCount ? 'red' : 'gray'}>[{props.zombieCount} zombies]</Text> : null}
@@ -783,7 +814,7 @@ function MainTable(props: {
   const fillerCount = Math.max(0, props.pageSize - Math.max(1, visible.length));
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Text><Text bold>PORTS + DEV BROWSERS</Text>  <Text dimColor>{showing}</Text></Text>
+      <Text><Text bold>{props.rows.some((row) => row.type === 'cua' || row.type === 'cua-group') ? 'PORTS + DEV BROWSERS + CUA' : 'PORTS + DEV BROWSERS'}</Text>  <Text dimColor>{showing}</Text></Text>
       <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST / RAM', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
       <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
       {visible.length === 0 ? (
@@ -812,13 +843,39 @@ function DataRow({row, selected, widths, config, columns, failed}: {
   columns: number;
   failed: boolean;
 }) {
+  if (row.type === 'cua-group') {
+    const connected = row.members.filter((entry) => entry.transportState === 'connected').length;
+    return <TableRow failed={failed}
+      values={['CUA', '-', `${row.members.length}x`, '-', '-', formatMemory(cuaGroupMemory(row.members)),
+        `${row.depth ? '| ' : ''}${row.expanded ? 'v ' : '> '}${row.family}`, `${row.members.length} connections · ${connected} connected · x stop group`]}
+      widths={widths} columns={columns} selected={selected} color="magenta"
+    />;
+  }
+  if (row.type === 'cua') {
+    const entry = row.cua;
+    return <TableRow failed={failed}
+      values={['CUA', '-', '-', String(entry.pid), formatSeconds(entry.ageSeconds), formatMemory(entry.memoryBytes), `${row.depth ? '| ' : ''}${entry.agent} CUA`,
+        `${entry.transportState === 'connected' ? (entry.sockets.some((socket) => socket.includes('codex-browser-use')) ? 'Chrome connected' : 'CUA connected') : entry.transportState === 'not-observed' ? 'runtime only' : entry.transportState} · ${sanitizeText(entry.cwd) || entry.label}`]}
+      widths={widths} columns={columns} selected={selected} color="magenta"
+    />;
+  }
+  if (row.type === 'project') {
+    const ports = [...new Set(row.members.map(({port}) => port))];
+    return <TableRow failed={failed}
+      values={[row.members.some(({kind}) => kind === 'dev') ? 'DEV' : row.members[0]!.kind.toUpperCase(),
+        row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, '-', '-',
+        [...new Set(row.members.map(({displayHost}) => displayHost))].join(', '), `${row.expanded ? 'v ' : '> '}${row.family}`,
+        `ports ${ports.join(', ')} · ${projectPids(row.members).length} processes · ${formatHomePath(row.root)}`]}
+      widths={widths} columns={columns} selected={selected} color="cyan"
+    />;
+  }
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
     const ports = [...new Set(row.members.map(({port}) => port))];
     return <TableRow failed={failed}
       values={[task ? 'TASK' : 'PID', row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, String(task?.root.pid ?? listener.pid), listener.elapsed,
-        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
+        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.depth ? '| ' : ''}${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
       widths={widths} columns={columns} selected={selected} color="cyan"
     />;
   }
@@ -907,13 +964,13 @@ function Details({row, config, columns, listeners}: {
   listeners: readonly ListenerEntry[];
 }) {
   const lines = detailLines(row, config, listeners);
-  const label = (row?.type === 'group' || row?.type === 'process')
+  const label = isGroupRow(row)
     ? row.family
     : row?.type === 'listener'
       ? row.listener.displayProject || '-'
       : row?.type === 'zombie'
         ? row.zombie.family
-        : row?.type === 'browser' ? row.browser.family : '';
+        : row?.type === 'cua' ? `${row.cua.agent} CUA` : row?.type === 'browser' ? row.browser.family : '';
   return (
     <Box flexDirection="column">
       <Text wrap="truncate-end"><Text bold>DETAILS</Text>{label ? <>  <Text dimColor>{sanitizeText(label)}</Text></> : null}</Text>
@@ -931,6 +988,37 @@ function detailLines(
   listeners: readonly ListenerEntry[],
 ): [string, string, string, string, string] {
   if (!row) return ['No process selected.', '', '', '', ''];
+  if (row.type === 'cua-group') {
+    const connected = row.members.filter((entry) => entry.transportState === 'connected').length;
+    return [
+      `${row.family}  ${row.members.length} connections  ${connected} connected  ${formatMemory(cuaGroupMemory(row.members))} RSS sum`,
+      `stop roots ${row.members.map(({pid}) => pid).join(', ')}`,
+      'group stop includes hidden/filter-excluded members; shared services and parent agents stay running',
+      `state ${row.expanded ? 'expanded' : 'collapsed'}  tab ownership unknown`,
+      'hint enter expand/collapse  x disconnect whole group  f force-stop whole group',
+    ];
+  }
+  if (row.type === 'cua') {
+    const entry = row.cua;
+    return [
+      `pid ${entry.pid}  parent ${entry.ppid}  ${entry.provider}  ${entry.transportState}  ${entry.members.length} processes`,
+      `dir ${sanitizeText(entry.cwd) || 'unknown'}  session ${entry.sessionId || 'unknown'}`,
+      `socket ${entry.sockets.map(sanitizeText).join(', ') || 'not observed'}`,
+      `tab owner unknown  last tool ${entry.lastCall || 'unknown'}`,
+      entry.canStop ? 'hint x disconnect this CUA connection  f force-stop  reconnect CUA from its agent' : 'shared service; select an agent CUA connection to disconnect',
+    ];
+  }
+  if (row.type === 'project') {
+    const pinned = row.members.filter((entry) => listenerIsPinned(entry, config.pinnedListenerKeys));
+    const commands = [...new Set(row.members.map(({displayCommand, args}) => redactCommandLine(displayCommand || args)).filter(Boolean))];
+    return [
+      `project ${row.family}  dir ${sanitizeText(formatHomePath(row.root))}  ${projectPids(row.members).length} processes started separately`,
+      `ports ${[...new Set(row.members.map(({port}) => port))].join(', ')}  pids ${projectPids(row.members).join(', ')}`,
+      `pin ${pinned.length === 0 ? 'NO' : pinned.length === row.members.length ? 'YES' : `ports ${pinned.map(({port}) => port).join(', ')}`}  state ${row.expanded ? 'expanded' : 'collapsed'}`,
+      `procs ${commands.slice(0, 3).join(' · ') || '-'}${commands.length > 3 ? ` +${commands.length - 3}` : ''}`,
+      `hint enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  select one process inside to stop it`,
+    ];
+  }
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
@@ -1013,11 +1101,15 @@ function ConfirmationBox({confirmation}: {confirmation: Confirmation}) {
 }
 
 function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number}) {
-  const shortcuts = row?.type === 'browser'
+  const shortcuts = row?.type === 'cua-group'
+    ? 'enter expand/collapse  x disconnect group  f force-stop group  c show/hide runtimes  / filter  q quit'
+    : row?.type === 'cua'
+    ? `${row.cua.canStop ? 'x disconnect CUA  f force-stop  ' : 'shared service · '}c show/hide runtimes  / filter  r refresh  q quit`
+    : row?.type === 'browser'
     ? 'x stop browser + helpers  f force-stop  a all/main  / filter  r refresh  ? help  q quit'
     : row?.type === 'process'
       ? 'enter expand/collapse  p pin group  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
-    : row?.type === 'group'
+    : row?.type === 'group' || row?.type === 'project'
     ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
     : row?.type === 'listener' && row.parentGroupKey
       ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
@@ -1025,6 +1117,24 @@ function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number})
         ? 'x stop  f force-stop  a all/main  g graveyard  s settings  q quit  z hide-zombies  / filter  r refresh  ? help'
         : '←/→ reorder  a all/main  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help';
   return <Text dimColor wrap="truncate-end">{truncateRawText(`keys: ${shortcuts}`, columns)}</Text>;
+}
+
+function cuaGroupMemory(members: readonly CuaConnection[]): number | null {
+  return members.every((entry) => entry.memoryBytes !== null) ? members.reduce((sum, entry) => sum + entry.memoryBytes!, 0) : null;
+}
+
+function isGroupRow(row: VisibleRow | null | undefined): row is GroupRow {
+  return row?.type === 'group' || row?.type === 'project' || row?.type === 'process' || row?.type === 'cua-group';
+}
+
+/** Every process a project row covers, counting each task member once. */
+function projectPids(members: readonly ListenerEntry[]): number[] {
+  return [...new Set(members.flatMap((entry) => entry.task?.members.map(({pid}) => pid) ?? [entry.pid]))];
+}
+
+function formatHomePath(input: string): string {
+  const home = homedir();
+  return input === home || input.startsWith(`${home}${path.sep}`) ? `~${input.slice(home.length)}` : input;
 }
 
 function SettingsScreen({config, selectedIndex, status, error, configPath, browserOverride, columns, terminalRows}: {
@@ -1172,9 +1282,10 @@ function HelpScreen() {
       <Text> </Text>
       <Text>↑/↓      move selection</Text>
       <Text>←/→      reorder a listener · collapse/expand a group</Text>
-      <Text>enter    expand/collapse an app group</Text>
+      <Text>enter    expand/collapse a project, task, PID, or app group</Text>
       <Text>a        toggle main/all LISTEN ports</Text>
       <Text>z        show/hide orphaned browser-automation processes</Text>
+      <Text>c        show/hide CUA runtimes with no observed transport connection</Text>
       <Text>p        pin/unpin a listener or group (pinned listeners cannot be stopped)</Text>
       <Text>o / m    open in browser / safely move to the next verified port</Text>
       <Text>x / f    SIGTERM / SIGKILL</Text>

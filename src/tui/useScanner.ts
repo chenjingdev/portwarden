@@ -2,7 +2,8 @@ import {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import type {PortwardenConfig} from '../config.js';
 import {collectListeners, selectListeners} from '../core/listeners.js';
-import type {BrowserSession, ListenerEntry, ZombieCandidate} from '../core/types.js';
+import type {BrowserSession, CuaConnection, ListenerEntry, ZombieCandidate} from '../core/types.js';
+import {collectCuaConnections} from '../core/cuaConnections.js';
 import {detectBrowserSessions} from '../core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates} from '../core/zombies.js';
 
@@ -11,6 +12,7 @@ export interface ScannerSnapshot {
   listeners: ListenerEntry[];
   zombies: ZombieCandidate[];
   browsers: BrowserSession[];
+  cua?: CuaConnection[];
   loading: boolean;
   refreshing: boolean;
   error: string;
@@ -28,6 +30,7 @@ const INITIAL_SNAPSHOT: ScannerSnapshot = {
   listeners: [],
   zombies: [],
   browsers: [],
+  cua: [],
   loading: true,
   refreshing: false,
   error: '',
@@ -70,6 +73,7 @@ export function useScanner({all, showZombies, config}: ScannerOptions): ScannerS
           processProvider: () => processPromise,
         });
         const [processes, allListeners] = await Promise.all([processPromise, listenerPromise]);
+        const cua = await collectCuaConnections(processes, {signal: abortController.signal});
         if (disposed || generation.current !== currentGeneration) {
           return;
         }
@@ -85,6 +89,7 @@ export function useScanner({all, showZombies, config}: ScannerOptions): ScannerS
           listeners: allListeners,
           zombies,
           browsers,
+          cua,
           loading: false,
           refreshing: false,
           error: '',

@@ -15,6 +15,7 @@ export const DUBEOLSIK_POSITION_ALIASES: ReadonlyMap<string, string> = new Map([
   ['ㅋ', 'z'],
   ['ㄱ', 'r'],
   ['ㅇ', 'd'],
+  ['ㅊ', 'c'],
 ]);
 
 export interface ShortcutKeyDescriptor {
