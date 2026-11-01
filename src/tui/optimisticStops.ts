@@ -22,7 +22,7 @@ export function rowIdentities(row: VisibleRow): string[] {
 export function failedRowsLast(rows: VisibleRow[], failed: ReadonlySet<string>): VisibleRow[] {
   const blocks: VisibleRow[][] = [];
   for (const row of rows) {
-    if (row.type === 'listener' && row.parentGroupKey && blocks.at(-1)?.[0]?.key === row.parentGroupKey) {
+    if ((row.type === 'listener' || row.type === 'process') && row.parentGroupKey && blocks.at(-1)?.some((parent) => parent.key === row.parentGroupKey)) {
       blocks.at(-1)!.push(row);
     } else {
       blocks.push([row]);

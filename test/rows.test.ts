@@ -44,6 +44,63 @@ describe('buildVisibleRows', () => {
     expect(rows.map(({type}) => type)).toEqual(['listener', 'listener']);
   });
 
+  it('collapses separately started servers from one project folder into one row, pinned or not', () => {
+    const root = '/Users/test/dev/honcho';
+    const dashboard = listener({pid: 201, port: 4173, projectRoot: root, displayProject: 'honcho'});
+    const other = listener({pid: 202, port: 8790, projectRoot: '/Users/test/dev/intent-router', displayProject: 'intent-router'});
+    const bridge = listener({pid: 203, port: 8766, projectRoot: root, displayProject: 'honcho'});
+    const options = {all: false, pinnedListenerKeys: [`host:${dashboard.host}::port:${dashboard.port}`]};
+    const collapsed = buildVisibleRows([dashboard, other, bridge], [], {...options, expandedGroups: new Set()});
+    expect(collapsed).toMatchObject([
+      {type: 'project', key: `project:${root}`, family: 'honcho', root, members: [dashboard, bridge], expanded: false},
+      {type: 'listener', listener: other},
+    ]);
+    const expanded = buildVisibleRows([dashboard, other, bridge], [], {...options, expandedGroups: new Set([`project:${root}`])});
+    expect(expanded.map((row) => [row.type, row.depth])).toEqual([['project', 0], ['listener', 1], ['listener', 1], ['listener', 0]]);
+    expect(expanded[2]).toMatchObject({listener: bridge, parentGroupKey: `project:${root}`});
+  });
+
+  it('keeps a lone process, app helpers, and unrelated folders out of project groups', () => {
+    const root = '/Users/test/dev/sample';
+    const rowTypes = (entries: ListenerEntry[]) => buildVisibleRows(entries, [], {
+      all: false, expandedGroups: new Set(), pinnedListenerKeys: [],
+    }).map(({type}) => type);
+    expect(rowTypes([listener({pid: 301, port: 3000, projectRoot: root}), listener({pid: 301, port: 3001, projectRoot: root})])).toEqual(['process']);
+    expect(rowTypes([
+      listener({pid: 302, port: 5001, kind: 'app', appFamily: 'Ollama', projectRoot: root}),
+      listener({pid: 303, port: 5002, kind: 'app', appFamily: 'Ollama', projectRoot: root}),
+    ])).toEqual(['listener', 'listener']);
+    expect(rowTypes([listener({pid: 304, port: 3002}), listener({pid: 305, port: 3003})])).toEqual(['listener', 'listener']);
+    expect(rowTypes([
+      listener({pid: 306, port: 3004, projectRoot: '/Users/test/dev/api', displayProject: 'api'}),
+      listener({pid: 307, port: 3005, projectRoot: '/Users/test/work/api', displayProject: 'api'}),
+    ])).toEqual(['listener', 'listener']);
+  });
+
+  it('nests a multi-port process inside an expanded project group', () => {
+    const root = '/Users/test/dev/sample';
+    const api = [listener({pid: 401, port: 3000, projectRoot: root}), listener({pid: 401, port: 3001, projectRoot: root})];
+    const web = listener({pid: 402, port: 5173, projectRoot: root});
+    const rows = buildVisibleRows([...api, web], [], {
+      all: false, pinnedListenerKeys: [], expandedGroups: new Set([`project:${root}`, 'process:401:']),
+    });
+    expect(rows.map((row) => [row.type, row.depth])).toEqual([
+      ['project', 0], ['process', 1], ['listener', 2], ['listener', 2], ['listener', 1],
+    ]);
+    expect(rows[0]).toMatchObject({members: [...api, web]});
+    expect(rows[1]).toMatchObject({key: 'process:401:', parentGroupKey: `project:${root}`});
+    expect(rows[2]).toMatchObject({parentGroupKey: 'process:401:'});
+  });
+
+  it('lets a filter narrow a project group down to the matching process', () => {
+    const root = '/Users/test/dev/honcho';
+    const rows = buildVisibleRows([
+      listener({pid: 501, port: 4173, projectRoot: root, args: 'node local-dashboard/server.mjs'}),
+      listener({pid: 502, port: 8766, projectRoot: root, args: 'python local-mcp-bridge/server.py'}),
+    ], [], {all: false, expandedGroups: new Set(), pinnedListenerKeys: [], query: 'mcp-bridge'});
+    expect(rows).toMatchObject([{type: 'listener', listener: {pid: 502}}]);
+  });
+
   it('groups app helpers only in all scope and expands them by stable group key', () => {
     const entries = [
       listener({pid: 10, port: 5001, kind: 'app', appFamily: 'Ollama'}),

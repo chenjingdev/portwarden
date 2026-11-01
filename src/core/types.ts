@@ -69,6 +69,8 @@ export interface ListenerEntry {
   kind: ListenerKind;
   appFamily: string;
   projectName: string;
+  /** Folder that names `projectName`; absent when the name came from the command line. */
+  projectRoot?: string;
   displayProject: string;
   displayCommand: string;
   displayCwd: string;

@@ -4,7 +4,8 @@ import type {BrowserSession, ListenerEntry, ZombieCandidate} from '../core/types
 
 export type VisibleRow =
   | {type: 'browser'; key: string; browser: BrowserSession; depth: 0}
-  | {type: 'process'; key: string; family: string; members: ListenerEntry[]; expanded: boolean; depth: 0}
+  | {type: 'project'; key: string; family: string; root: string; members: ListenerEntry[]; expanded: boolean; depth: 0}
+  | {type: 'process'; key: string; family: string; members: ListenerEntry[]; expanded: boolean; depth: number; parentGroupKey?: string}
   | {type: 'listener'; key: string; listener: ListenerEntry; depth: number; parentGroupKey?: string}
   | {type: 'group'; key: string; family: string; members: ListenerEntry[]; expanded: boolean; depth: 0}
   | {type: 'zombie'; key: string; zombie: ZombieCandidate; depth: 0};
@@ -42,6 +43,36 @@ export function buildVisibleRows(
   const eligible = listeners.filter((entry) => (byPid.get(scopeKey(entry)) ?? [entry]).some(matches) &&
     (!browserPids.has(entry.pid) || listenerIsPinned(entry, options.pinnedListenerKeys)));
 
+  // Separately started processes from one project folder share a row. App
+  // helpers keep their family grouping, and a lone task or PID keeps its row.
+  const projectOfScope = new Map<string, string>();
+  const projects = new Map<string, {family: string; root: string; scopes: Map<string, ListenerEntry>}>();
+  for (const entry of eligible) {
+    const scope = scopeKey(entry);
+    if (projectOfScope.has(scope)) continue;
+    const root = entry.kind === 'app' ? '' : entry.projectRoot ?? '';
+    const key = root ? `project:${root}` : '';
+    projectOfScope.set(scope, key);
+    if (!key) continue;
+    const project = projects.get(key) ?? {family: entry.displayProject || entry.command, root, scopes: new Map()};
+    project.scopes.set(scope, entry);
+    projects.set(key, project);
+  }
+  const projectKey = (entry: ListenerEntry) => {
+    const key = projectOfScope.get(scopeKey(entry)) ?? '';
+    return (projects.get(key)?.scopes.size ?? 0) > 1 ? key : '';
+  };
+  const scopeRows = (listener: ListenerEntry, depth: number, parentGroupKey?: string): VisibleRow[] => {
+    const members = byPid.get(scopeKey(listener)) ?? [listener];
+    if (!listener.task && members.length < 2) return [listenerRow(listener, depth, parentGroupKey)];
+    const key = processKey(listener);
+    const expanded = options.expandedGroups.has(key);
+    return [
+      {type: 'process', key, family: listener.displayProject || listener.command, members, expanded, depth, parentGroupKey},
+      ...(expanded ? members.map((entry) => listenerRow(entry, depth + 1, key)) : []),
+    ];
+  };
+
   for (const listener of eligible) {
     if (listener.task || (byPid.get(scopeKey(listener))?.length ?? 0) > 1) continue;
     if (
@@ -59,14 +90,23 @@ export function buildVisibleRows(
 
   const emittedGroups = new Set<string>();
   for (const listener of eligible) {
+    const project = projectKey(listener);
+    if (project) {
+      if (emittedGroups.has(project)) continue;
+      emittedGroups.add(project);
+      const {family, root, scopes} = projects.get(project)!;
+      const expanded = options.expandedGroups.has(project);
+      const members = [...scopes].flatMap(([scope, first]) => byPid.get(scope) ?? [first]);
+      listenerRows.push({type: 'project', key: project, family, root, members, expanded, depth: 0});
+      if (expanded) for (const first of scopes.values()) listenerRows.push(...scopeRows(first, 1, project));
+      continue;
+    }
     const members = byPid.get(scopeKey(listener))!;
     if (listener.task || members.length > 1) {
-      const key = listener.task?.key ?? `process:${listener.pid}:${listener.startTime?.getTime() ?? ''}`;
+      const key = processKey(listener);
       if (emittedGroups.has(key)) continue;
       emittedGroups.add(key);
-      const expanded = options.expandedGroups.has(key);
-      listenerRows.push({type: 'process', key, family: listener.displayProject || listener.command, members, expanded, depth: 0});
-      if (expanded) listenerRows.push(...members.map((entry) => listenerRow(entry, 1, key)));
+      listenerRows.push(...scopeRows(listener, 0));
       continue;
     }
     if (
@@ -131,6 +171,10 @@ export function rowLabel(row: VisibleRow): string {
 
 function listenerRow(listener: ListenerEntry, depth = 0, parentGroupKey?: string): VisibleRow {
   return {type: 'listener', key: `listener:${selectionKey(listener)}`, listener, depth, parentGroupKey};
+}
+
+function processKey(listener: ListenerEntry): string {
+  return listener.task?.key ?? `process:${listener.pid}:${listener.startTime?.getTime() ?? ''}`;
 }
 
 function listenerSearchText(entry: ListenerEntry): string {

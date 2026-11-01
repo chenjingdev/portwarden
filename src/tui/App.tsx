@@ -1,3 +1,6 @@
+import {homedir} from 'node:os';
+import path from 'node:path';
+
 import {useEffect, useMemo, useRef, useState} from 'react';
 
 import {Box, Text, useApp, useInput, useStdout} from 'ink';
@@ -21,6 +24,7 @@ import {useScanner} from './useScanner.js';
 import {failedRowsLast, processIdentity, rowIdentities, type StopPresentation} from './optimisticStops.js';
 
 type Screen = 'main' | 'settings' | 'browser' | 'graveyard' | 'help';
+type GroupRow = Extract<VisibleRow, {type: 'group' | 'project' | 'process'}>;
 
 interface Confirmation {
   title: string;
@@ -248,7 +252,7 @@ export function PortwardenApp({
 
   const toggleSelectedPin = () => {
     pendingSelectionKey.current = null;
-    if (selectedRow?.type !== 'listener' && selectedRow?.type !== 'group' && selectedRow?.type !== 'process') {
+    if (selectedRow?.type !== 'listener' && selectedRow?.type !== 'group' && selectedRow?.type !== 'project' && selectedRow?.type !== 'process') {
       setActionError('Only LISTEN ports and their groups can be pinned.');
       return;
     }
@@ -286,7 +290,7 @@ export function PortwardenApp({
   const reorderSelected = (direction: -1 | 1) => {
     pendingSelectionKey.current = null;
     if (selectedRow?.type !== 'listener') {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, direction > 0);
+      if (isGroupRow(selectedRow)) toggleGroup(selectedRow, direction > 0);
       return;
     }
     const selectedPinned = listenerIsPinned(selectedRow.listener, config.pinnedListenerKeys);
@@ -321,7 +325,7 @@ export function PortwardenApp({
     );
   };
 
-  const toggleGroup = (row: Extract<VisibleRow, {type: 'group' | 'process'}>, force?: boolean) => {
+  const toggleGroup = (row: GroupRow, force?: boolean) => {
     pendingSelectionKey.current = null;
     setExpandedGroups((current) => {
       const next = new Set(current);
@@ -332,21 +336,21 @@ export function PortwardenApp({
     });
   };
 
-  const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener'}>): boolean => {
+  const collapseParentGroup = (row: Extract<VisibleRow, {type: 'listener' | 'process'}>): boolean => {
     if (!row.parentGroupKey) return false;
-    const parent = visibleRows.find((candidate): candidate is Extract<VisibleRow, {type: 'group' | 'process'}> =>
-      (candidate.type === 'group' || candidate.type === 'process') && candidate.key === row.parentGroupKey,
+    const parent = visibleRows.find((candidate): candidate is GroupRow =>
+      isGroupRow(candidate) && candidate.key === row.parentGroupKey,
     );
     if (!parent) return false;
     setSelectedKey(parent.key);
     selectionIndexHint.current = visibleRows.findIndex(({key}) => key === parent.key);
     toggleGroup(parent, false);
-    setStatus(`Collapsed app group: ${parent.family}.`);
+    setStatus(`Collapsed group: ${parent.family}.`);
     return true;
   };
 
   const stopSelected = (signal: StopSignal) => {
-    if (!selectedRow || selectedRow.type === 'group') {
+    if (!selectedRow || selectedRow.type === 'group' || selectedRow.type === 'project') {
       setActionError(selectedRow ? 'Expand the group and select one process first.' : 'No process selected.');
       return;
     }
@@ -578,12 +582,13 @@ export function PortwardenApp({
     } else if (key.downArrow) {
       moveMainSelection(1);
     } else if (key.leftArrow) {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, false);
+      if (selectedRow?.type === 'process' && !selectedRow.expanded && selectedRow.parentGroupKey) collapseParentGroup(selectedRow);
+      else if (isGroupRow(selectedRow)) toggleGroup(selectedRow, false);
       else if (selectedRow?.type !== 'listener' || !collapseParentGroup(selectedRow)) reorderSelected(-1);
     } else if (key.rightArrow) {
-      if ((selectedRow?.type === 'group' || selectedRow?.type === 'process')) toggleGroup(selectedRow, true);
+      if (isGroupRow(selectedRow)) toggleGroup(selectedRow, true);
       else reorderSelected(1);
-    } else if (key.return && (selectedRow?.type === 'group' || selectedRow?.type === 'process')) {
+    } else if (key.return && isGroupRow(selectedRow)) {
       toggleGroup(selectedRow);
     } else if (key.return && selectedRow?.type === 'listener' && selectedRow.parentGroupKey) {
       collapseParentGroup(selectedRow);
@@ -812,13 +817,23 @@ function DataRow({row, selected, widths, config, columns, failed}: {
   columns: number;
   failed: boolean;
 }) {
+  if (row.type === 'project') {
+    const ports = [...new Set(row.members.map(({port}) => port))];
+    return <TableRow failed={failed}
+      values={[row.members.some(({kind}) => kind === 'dev') ? 'DEV' : row.members[0]!.kind.toUpperCase(),
+        row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, '-', '-',
+        [...new Set(row.members.map(({displayHost}) => displayHost))].join(', '), `${row.expanded ? 'v ' : '> '}${row.family}`,
+        `ports ${ports.join(', ')} · ${projectPids(row.members).length} processes · ${formatHomePath(row.root)}`]}
+      widths={widths} columns={columns} selected={selected} color="cyan"
+    />;
+  }
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
     const ports = [...new Set(row.members.map(({port}) => port))];
     return <TableRow failed={failed}
       values={[task ? 'TASK' : 'PID', row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, String(task?.root.pid ?? listener.pid), listener.elapsed,
-        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
+        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.depth ? '| ' : ''}${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
       widths={widths} columns={columns} selected={selected} color="cyan"
     />;
   }
@@ -907,7 +922,7 @@ function Details({row, config, columns, listeners}: {
   listeners: readonly ListenerEntry[];
 }) {
   const lines = detailLines(row, config, listeners);
-  const label = (row?.type === 'group' || row?.type === 'process')
+  const label = isGroupRow(row)
     ? row.family
     : row?.type === 'listener'
       ? row.listener.displayProject || '-'
@@ -931,6 +946,17 @@ function detailLines(
   listeners: readonly ListenerEntry[],
 ): [string, string, string, string, string] {
   if (!row) return ['No process selected.', '', '', '', ''];
+  if (row.type === 'project') {
+    const pinned = row.members.filter((entry) => listenerIsPinned(entry, config.pinnedListenerKeys));
+    const commands = [...new Set(row.members.map(({displayCommand, args}) => redactCommandLine(displayCommand || args)).filter(Boolean))];
+    return [
+      `project ${row.family}  dir ${sanitizeText(formatHomePath(row.root))}  ${projectPids(row.members).length} processes started separately`,
+      `ports ${[...new Set(row.members.map(({port}) => port))].join(', ')}  pids ${projectPids(row.members).join(', ')}`,
+      `pin ${pinned.length === 0 ? 'NO' : pinned.length === row.members.length ? 'YES' : `ports ${pinned.map(({port}) => port).join(', ')}`}  state ${row.expanded ? 'expanded' : 'collapsed'}`,
+      `procs ${commands.slice(0, 3).join(' · ') || '-'}${commands.length > 3 ? ` +${commands.length - 3}` : ''}`,
+      `hint enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  select one process inside to stop it`,
+    ];
+  }
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
@@ -1017,7 +1043,7 @@ function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number})
     ? 'x stop browser + helpers  f force-stop  a all/main  / filter  r refresh  ? help  q quit'
     : row?.type === 'process'
       ? 'enter expand/collapse  p pin group  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
-    : row?.type === 'group'
+    : row?.type === 'group' || row?.type === 'project'
     ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
     : row?.type === 'listener' && row.parentGroupKey
       ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
@@ -1025,6 +1051,20 @@ function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number})
         ? 'x stop  f force-stop  a all/main  g graveyard  s settings  q quit  z hide-zombies  / filter  r refresh  ? help'
         : '←/→ reorder  a all/main  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help';
   return <Text dimColor wrap="truncate-end">{truncateRawText(`keys: ${shortcuts}`, columns)}</Text>;
+}
+
+function isGroupRow(row: VisibleRow | null | undefined): row is GroupRow {
+  return row?.type === 'group' || row?.type === 'project' || row?.type === 'process';
+}
+
+/** Every process a project row covers, counting each task member once. */
+function projectPids(members: readonly ListenerEntry[]): number[] {
+  return [...new Set(members.flatMap((entry) => entry.task?.members.map(({pid}) => pid) ?? [entry.pid]))];
+}
+
+function formatHomePath(input: string): string {
+  const home = homedir();
+  return input === home || input.startsWith(`${home}${path.sep}`) ? `~${input.slice(home.length)}` : input;
 }
 
 function SettingsScreen({config, selectedIndex, status, error, configPath, browserOverride, columns, terminalRows}: {
@@ -1172,7 +1212,7 @@ function HelpScreen() {
       <Text> </Text>
       <Text>↑/↓      move selection</Text>
       <Text>←/→      reorder a listener · collapse/expand a group</Text>
-      <Text>enter    expand/collapse an app group</Text>
+      <Text>enter    expand/collapse a project, task, PID, or app group</Text>
       <Text>a        toggle main/all LISTEN ports</Text>
       <Text>z        show/hide orphaned browser-automation processes</Text>
       <Text>p        pin/unpin a listener or group (pinned listeners cannot be stopped)</Text>
