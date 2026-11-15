@@ -1,6 +1,6 @@
-import {useEffect, useMemo, useRef, useState} from 'react';
+import {useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState} from 'react';
 
-import {Box, Text, useApp, useInput, useStdout} from 'ink';
+import {Box, Text, useApp, useInput, useStdout, type Key} from 'ink';
 
 import {openInBrowser} from '../browser.js';
 import {buildBrowserOptions, detectInstalledBrowsers, type BrowserOption} from '../browserCandidates.js';
@@ -483,7 +483,7 @@ export function PortwardenApp({
     );
   };
 
-  useInput((input, key) => {
+  const handleInput = (input: string, key: Key) => {
     const normalized = normalizeShortcut(input, key);
     if (key.ctrl && normalized === 'c') {
       if (!actionInFlight.current && !stopsRef.current.some(({phase}) => phase === 'pending')) {
@@ -636,7 +636,13 @@ export function PortwardenApp({
       setQuery('');
       setStatus('Filter cleared.');
     }
+  };
+  // Keep Ink's subscription stable and use the selection from the last commit.
+  const committedInputHandler = useRef(handleInput);
+  useLayoutEffect(() => {
+    committedInputHandler.current = handleInput;
   });
+  useInput(useCallback((input, key) => committedInputHandler.current(input, key), []));
 
   if (screen === 'settings') {
     return (

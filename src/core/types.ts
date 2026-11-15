@@ -47,6 +47,8 @@ export interface ProcessTask {
 
 export interface ListenerEntry {
   task?: ProcessTask;
+  /** A possible launcher could not be verified, so the stop scope is uncertain. */
+  stopBlockedReason?: string;
   pid: number;
   ppid: number | null;
   /** POSIX job-control group that owns this listener. */

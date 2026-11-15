@@ -174,12 +174,18 @@ function commandError(file: string, result: CommandResult): Error {
 async function runLsof(
   args: readonly string[],
   options: Pick<CollectListenersOptions, 'runCommand' | 'signal' | 'strict'>,
+  allowPartialOutput = false,
 ): Promise<string> {
   const runner = options.runCommand ?? defaultCommandRunner;
   try {
     const result = await runner('lsof', args, options.signal);
     if (result.exitCode === 0) return result.stdout;
     if (isNoMatchesResult(result)) return '';
+    // PID metadata lookups can return status 1 and records for the PIDs
+    // that still exist. Callers verify the records they need for each action.
+    if (allowPartialOutput && result.exitCode === 1 && result.stdout.trim() && !result.stderr?.trim()) {
+      return result.stdout;
+    }
     if (options.strict) throw commandError('lsof', result);
     return '';
   } catch (error) {
@@ -349,7 +355,7 @@ export async function collectProcessMetadata(
 
   const outputs = await Promise.all(
     chunks.map((chunk) =>
-      runLsof(['-nP', '-a', '-d', 'cwd,txt', '-p', chunk.join(','), '-F0fgpnu'], options),
+      runLsof(['-nP', '-a', '-d', 'cwd,txt', '-p', chunk.join(','), '-F0fgpnu'], options, true),
     ),
   );
   const result = new Map<number, LsofProcessMetadata>();

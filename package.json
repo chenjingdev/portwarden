@@ -1,6 +1,6 @@
 {
   "name": "portwarden",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Fast interactive port and orphaned-process manager for local development",
   "type": "module",
   "author": "chenjingdev",

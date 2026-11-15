@@ -9,7 +9,7 @@ import {PortwardenActions} from '../src/core/actions.js';
 import {detectBrowserSessions, formatMemory} from '../src/core/browserSessions.js';
 import {listenerKey} from '../src/core/listeners.js';
 import type {ListenerEntry, ProcessInfo} from '../src/core/types.js';
-import {collectProcesses, detectZombieCandidates, parseResidentMemory} from '../src/core/zombies.js';
+import {collectProcesses, detectZombieCandidates, parseProcessResources} from '../src/core/zombies.js';
 import {renderOutput} from '../src/output.js';
 import {buildVisibleRows} from '../src/tui/rows.js';
 
@@ -71,10 +71,17 @@ describe('development browser inventory', () => {
     expect(session?.memoryBytes).toBeNull();
     expect(formatMemory(null)).toBe('? RAM');
   });
-  it('collects RSS in bytes without rounded percentage estimates', async () => {
-    expect([...parseResidentMemory(' 101 1234\n102 0\nBAD 45\n103 -4')]).toEqual([[101, 1234 * 1024], [102, 0]]);
-    const processes = await collectProcesses({provider: async () => [{pid: 101, ppid: 1, name: 'chrome'}], memoryProvider: async () => new Map([[101, 1234]])});
-    expect(processes[0]?.rssBytes).toBe(1234);
+  it('reports RSS in bytes and omits defunct processes from the live inventory', async () => {
+    const processes = await collectProcesses({
+      provider: async () => [
+        {pid: 101, ppid: 1, name: 'chrome'},
+        {pid: 102, ppid: 101, name: 'chrome helper'},
+        {pid: 103, ppid: 101, name: 'exited helper'},
+        {pid: 104, ppid: 101, name: 'helper with unknown RSS'},
+      ],
+      resourceProvider: async () => parseProcessResources(' 101 1234 S+\n102 0 S\n103 0 Zs\n104 -4 S'),
+    });
+    expect(processes.map(({pid, rssBytes}) => [pid, rssBytes])).toEqual([[101, 1234 * 1024], [102, 0], [104, undefined]]);
   });
   it('shows sessions once without a port or zombie opt-in and emits structured memory totals', () => {
     const sessions = detectBrowserSessions([root(), helper()]);

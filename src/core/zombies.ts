@@ -43,8 +43,13 @@ export interface DetectZombieOptions {
 
 export interface CollectProcessesOptions {
   provider?: () => Promise<readonly ProcessDescriptor[]>;
-  memoryProvider?: () => Promise<ReadonlyMap<number, number>>;
+  resourceProvider?: () => Promise<ReadonlyMap<number, ProcessResources>>;
   now?: Date | number;
+}
+
+interface ProcessResources {
+  rssBytes: number;
+  defunct: boolean;
 }
 
 export interface ZombieCommandRunner {
@@ -85,33 +90,43 @@ export interface WaitForZombieExitOptions {
 
 export async function collectProcesses(options: CollectProcessesOptions = {}): Promise<ProcessInfo[]> {
   const provider = options.provider ?? (() => psList({all: true}));
-  const [descriptors, memory] = await Promise.all([
+  const resourceProvider = options.resourceProvider ??
+    (options.provider ? () => new Map<number, ProcessResources>() : collectProcessResources);
+  const [descriptors, resources] = await Promise.all([
     provider(),
-    options.memoryProvider ? options.memoryProvider() : options.provider ? Promise.resolve(new Map<number, number>()) : collectResidentMemory(),
+    resourceProvider(),
   ]);
   const now = toTimestamp(options.now ?? Date.now());
   return descriptors
-    .filter(({pid}) => Number.isSafeInteger(pid) && pid > 0)
-    .map((descriptor) => ({...processFromDescriptor(descriptor, now), ...(memory.has(descriptor.pid) ? {rssBytes: memory.get(descriptor.pid)} : {})}))
+    .flatMap((descriptor) => {
+      const {pid} = descriptor;
+      const resource = resources.get(pid);
+      // The OS has already terminated a state-Z process. Only its table
+      // entry remains until the parent reads its exit status.
+      if (!Number.isSafeInteger(pid) || pid <= 0 || resource?.defunct) return [];
+      return [{...processFromDescriptor(descriptor, now), ...(resource ? {rssBytes: resource.rssBytes} : {})}];
+    })
     .sort((left, right) => left.pid - right.pid);
 }
 
-export function parseResidentMemory(raw: string): Map<number, number> {
-  const result = new Map<number, number>();
+export function parseProcessResources(raw: string): Map<number, ProcessResources> {
+  const result = new Map<number, ProcessResources>();
   for (const line of raw.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
     if (!match) continue;
     const pid = Number(match[1]);
     const bytes = Number(match[2]) * 1024;
-    if (pid > 0 && Number.isSafeInteger(pid) && Number.isSafeInteger(bytes)) result.set(pid, bytes);
+    if (pid > 0 && Number.isSafeInteger(pid) && Number.isSafeInteger(bytes)) {
+      result.set(pid, {rssBytes: bytes, defunct: match[3]!.startsWith('Z')});
+    }
   }
   return result;
 }
 
-async function collectResidentMemory(): Promise<Map<number, number>> {
+async function collectProcessResources(): Promise<Map<number, ProcessResources>> {
   try {
-    const result = await execa('ps', ['-axo', 'pid=,rss='], {reject: false});
-    return result.exitCode === 0 ? parseResidentMemory(result.stdout) : new Map();
+    const result = await execa('ps', ['-axo', 'pid=,rss=,stat='], {reject: false});
+    return result.exitCode === 0 ? parseProcessResources(result.stdout) : new Map();
   } catch {
     return new Map();
   }

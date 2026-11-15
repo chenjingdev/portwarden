@@ -110,13 +110,18 @@ export async function attachProcessTasks(
     collector = byPid.get(collector.ppid);
   }
   const roots = new Map<number, {root: ProcessInfo; label: string}>();
+  const launcherErrors = new Map<number, string>();
   for (const seed of seeds) {
     let root = byPid.get(seed.pid)!;
     const seen = new Set<number>([root.pid]);
     while (root.ppid > 1 && !seen.has(root.ppid)) {
       const parent = byPid.get(root.ppid);
-      if (!parent || parent.uid !== uid || protectedPids.has(parent.pid) ||
-        !root.cwd || root.cwd !== parent.cwd || !isDevLauncher(parent)) break;
+      if (!parent || parent.uid !== uid || protectedPids.has(parent.pid) || !isDevLauncher(parent)) break;
+      if (!root.cwd || !parent.cwd) {
+        launcherErrors.set(root.pid, `Could not verify the working directory for launcher PID ${parent.pid}. Refresh before stopping.`);
+        break;
+      }
+      if (root.cwd !== parent.cwd) break;
       seen.add(parent.pid);
       root = parent;
     }
@@ -128,19 +133,23 @@ export async function attachProcessTasks(
     if (scope.members.length < 2 || scopes.some((other) => other.root.pid !== scope.root.pid &&
       other.members.some(({pid}) => pid === scope.root.pid))) continue;
     const pids = new Set(scope.members.map(({pid}) => pid));
-    const blocked = scope.members.find((member) => protectedPids.has(member.pid) || member.uid !== uid ||
+    const blockedMember = scope.members.find((member) => protectedPids.has(member.pid) || member.uid !== uid ||
       !member.executable.startsWith('/') || !member.command || !member.startTime || !Number.isFinite(member.startTime.getTime()));
+    const blockedReason = launcherErrors.get(scope.root.pid) ??
+      (blockedMember ? `PID ${blockedMember.pid} is protected or has incomplete identity data.` : undefined);
     tasks.push({
       ...scope, key: `task:${scope.root.pid}:${scope.root.startTime?.getTime() ?? ''}`,
       ports: [...new Set(listeners.filter(({pid}) => pids.has(pid)).map(({port}) => port))].sort((a, b) => a - b),
       memoryBytes: scope.members.every(({rssBytes}) => rssBytes !== undefined)
         ? scope.members.reduce((sum, {rssBytes}) => sum + (rssBytes ?? 0), 0) : null,
-      ...(blocked ? {blockedReason: `PID ${blocked.pid} is protected or has incomplete identity data.`} : {}),
+      ...(blockedReason ? {blockedReason} : {}),
     });
   }
   return listeners.map((listener) => {
     const task = tasks.find(({members}) => members.some(({pid}) => pid === listener.pid));
-    return task ? {...listener, task} : listener;
+    if (task) return {...listener, task};
+    const stopBlockedReason = launcherErrors.get(listener.pid);
+    return stopBlockedReason ? {...listener, stopBlockedReason} : listener;
   });
 }
 

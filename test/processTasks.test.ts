@@ -117,6 +117,27 @@ describe('task cleanup', () => {
     await expect(actions.stopListener(grouped[0]!, 'SIGKILL')).rejects.toMatchObject({code: 'PINNED'});
     expect(kill).not.toHaveBeenCalled();
   });
+  it.each([false, true])('blocks force-stop with an unresolved launcher cwd (grouped: %s)', async (grouped) => {
+    const ps = [
+      proc(100, 1, 'npm run dev', {cwd: undefined}),
+      proc(102, 100, '/usr/bin/node server.js'),
+      proc(200, 100, '/usr/bin/node unrelated.js'),
+      ...(grouped ? [proc(103, 102, '/usr/bin/node worker.js')] : []),
+    ];
+    const selected = listener(102, 3000);
+    const sibling = listener(200, 4000, '/usr/bin/node unrelated.js');
+    const collect = async () => attachProcessTasks([selected, sibling], ps, metadata);
+    const config = repo();
+    config.update({pinnedListenerKeys: [listenerKey(sibling)]});
+    const kill = vi.fn();
+    const actions = new PortwardenActions(config, {collect, processProvider: async () => ps, kill});
+
+    await expect(actions.stopListener((await collect())[0]!, 'SIGKILL')).rejects.toMatchObject({
+      code: 'STALE_PROCESS',
+      message: expect.stringContaining('launcher PID 100'),
+    });
+    expect(kill).not.toHaveBeenCalled();
+  });
   it.each(['new member', 'changed member', 'new port'])('requires a new displayed scope after a %s appears', async (change) => {
     const grouped = await attachProcessTasks(listeners(), inventory(), metadata);
     const ps = inventory(); const ls = listeners();

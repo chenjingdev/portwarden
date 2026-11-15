@@ -529,6 +529,7 @@ export class PortwardenActions {
     if (!current) {
       throw new ActionError(`PID ${expected.pid} changed or stopped; refresh before acting.`, 'STALE_PROCESS');
     }
+    if (current.stopBlockedReason) throw new ActionError(current.stopBlockedReason, 'STALE_PROCESS');
     if (Boolean(current.task) !== Boolean(expected.task) ||
       (current.task && expected.task && !sameTaskSnapshot(current.task, expected.task))) {
       throw new ActionError('The task process/port scope changed. Refresh before stopping; nothing was killed.', 'STALE_PROCESS');

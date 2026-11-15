@@ -257,6 +257,35 @@ describe('lsof parsing and enrichment', () => {
     expect(selectListeners(result)).toEqual(result);
   });
 
+  it('uses partial PID metadata in a strict scan without trusting an unresolved member', async () => {
+    const uid = process.getuid!();
+    const startTime = new Date('2026-08-27T00:00:00.000Z');
+    const cwd = '/Users/test/dev/alpha';
+    const processProvider = async () => [
+      {pid: 101, ppid: 1, uid, startTime, name: 'node', command: 'node server.js', executable: '/bin/node'},
+      {pid: 102, ppid: 101, uid, startTime, name: 'node', command: 'node worker.js', executable: ''},
+      {pid: 103, ppid: 101, uid, startTime, name: 'node', command: 'node exited.js', executable: ''},
+    ];
+    const runCommand = async (_file: string, args: readonly string[]) => {
+      if (args.includes('-iTCP')) {
+        return {exitCode: 0, stdout: 'p101\ncnode\nn127.0.0.1:3000\n'};
+      }
+      if (args.includes('102,103')) {
+        return {exitCode: 1, stdout: `p102\nu${uid}\nfcwd\nn${cwd}\nftxt\nn/bin/node\n`};
+      }
+      return {exitCode: 0, stdout: `p101\nfcwd\nn${cwd}\n`};
+    };
+    const listeners = await collectListeners({strict: true, processProvider, runCommand});
+    expect(listeners).toHaveLength(1);
+    expect(listeners[0]).toMatchObject({pid: 101, task: {blockedReason: expect.stringContaining('103')}});
+    expect(listeners[0]?.task?.members).toContainEqual(expect.objectContaining({pid: 102, executable: '/bin/node'}));
+  });
+
+  it('rejects a failed LISTEN inventory even with some listener records', async () => {
+    const runCommand = async () => ({exitCode: 1, stdout: 'p101\ncnode\nn127.0.0.1:3000\n'});
+    await expect(collectListeners({strict: true, runCommand})).rejects.toThrow('lsof exited with code 1');
+  });
+
   it('degrades to an empty list by default but surfaces lsof failures in strict mode', async () => {
     const runCommand = async () => ({exitCode: 2, stdout: '', stderr: 'permission denied'});
     await expect(collectListeners({runCommand})).resolves.toEqual([]);
