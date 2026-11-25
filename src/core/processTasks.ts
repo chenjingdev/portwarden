@@ -15,6 +15,11 @@ export function isDevLauncher(entry: ProcessInfo): boolean {
   const argv = snapshot.argv;
   const name = path.basename(argv[0] ?? '').toLowerCase();
   if (DEV_TOOLS.has(name)) return true;
+  if ((name === 'npm' && argv[1] === 'exec') || name === 'npx') {
+    const rest = argv.slice(name === 'npx' ? 1 : 2).filter((token) => !token.startsWith('-'));
+    const tool = (rest[0] ?? '').replace(/(.)@.*$/, '$1');
+    return Boolean(tool) && isDevLauncher({...entry, command: [tool, ...rest.slice(1)].join(' ')});
+  }
   if (['npm', 'pnpm', 'yarn', 'bun'].includes(name)) {
     const command = argv[1] === 'run' || argv[1] === 'run-script' ? argv[2] : argv[1];
     return Boolean(command && /^(?:dev|start|serve|preview|watch)(?::[\w-]+)?$/.test(command));
@@ -31,7 +36,8 @@ export function isDevLauncher(entry: ProcessInfo): boolean {
     if (argv[1] === '-m') return DEV_TOOLS.has(argv[2] ?? '');
     if (argv[1] === '--watch' || argv[1]?.startsWith('--watch-path=')) return true;
     const script = argv[1] ?? '';
-    const packageManager = /\/node_modules\/npm\/bin\/npm-cli\.js$/.test(script) ? 'npm'
+    const binManager = /\/node_modules\/\.bin\/(npm|pnpm|yarn)$/.exec(script)?.[1];
+    const packageManager = binManager ? binManager : /\/node_modules\/npm\/bin\/npm-cli\.js$/.test(script) ? 'npm'
       : /\/node_modules\/pnpm\/bin\/pnpm\.(?:c?js)$/.test(script) ? 'pnpm'
         : /\/node_modules\/yarn\/bin\/yarn\.js$/.test(script) ? 'yarn' : '';
     if (packageManager) return isDevLauncher({...entry, command: [packageManager, ...argv.slice(2)].join(' ')});

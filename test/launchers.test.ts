@@ -35,7 +35,8 @@ const hcTerminals = JSON.stringify({terminals: [
 ]});
 
 function target(overrides: Partial<LauncherTarget> = {}): LauncherTarget {
-  return {pid: 500, ppid: 1, cwd: '/Users/test/dev/app', command: 'python3 -m http.server 4801', executable: '', shared: false, ...overrides};
+  const pid = overrides.pid ?? 500;
+  return {pid, envPids: [pid], ppid: 1, cwd: '/Users/test/dev/app', command: 'python3 -m http.server 4801', executable: '', shared: false, ...overrides};
 }
 
 function options(env: Record<number, string>, extra: Partial<LauncherOptions> = {}): LauncherOptions {
@@ -150,7 +151,7 @@ describe('leftovers', () => {
   const ended = `x CLAUDE_CODE_SESSION_ID=${ENDED_SESSION}`;
   const live = `x CLAUDE_CODE_SESSION_ID=${LIVE_SESSION}`;
 
-  it('flags an orphaned process of an ended launcher, but not live launchers, parented processes, or installed programs', async () => {
+  it('flags every process of an ended launcher, whatever its parent, but not live launchers or installed programs', async () => {
     const khalaUi = listener({
       pid: 601, port: 4179, command: 'node', executable: '/opt/homebrew/Cellar/node/26.8.1/bin/node',
       args: `/opt/homebrew/Cellar/node/26.8.1/bin/node ${home}/.claude/plugins/cache/khala/khala/0.17.66/scripts/ui.mjs`,
@@ -162,7 +163,7 @@ describe('leftovers', () => {
       listener({pid: 604, port: 4804}),
       khalaUi,
     ], [], processes, options({600: ended, 602: live, 603: ended, 604: 'x HOME=/Users/test', 601: ended}));
-    expect(listeners.map(({pid, leftover}) => [pid, leftover])).toEqual([[600, true], [602, false], [603, false], [604, false], [601, false]]);
+    expect(listeners.map(({pid, leftover}) => [pid, leftover])).toEqual([[600, true], [602, false], [603, true], [604, false], [601, false]]);
     expect(listeners[0]?.launcher).toMatchObject({sessionId: ENDED_SESSION, state: 'ended'});
     expect(listeners[1]?.launcher).toMatchObject({state: 'live'});
     expect(listeners[3]).not.toHaveProperty('launcher');
@@ -179,12 +180,22 @@ describe('leftovers', () => {
     expect(listeners[0]).toMatchObject({leftover: true, launcher: {state: 'ended'}});
   });
 
-  it('flags an orphaned browser session of an ended launcher even when the browser app is installed', async () => {
+  it('reads the launcher from another task member when the root rewrote its environment', async () => {
+    const root: ProcessInfo = {pid: 710, ppid: 1, name: 'npm', command: 'npm exec pnpm@11 dev', executable: '/opt/homebrew/bin/npm', cwd: '/Users/test/dev/app'};
+    const child: ProcessInfo = {...root, pid: 711, ppid: 710, command: 'node vite'};
+    const task: ProcessTask = {key: 'task:710', root, members: [root, child], ports: [4806], label: 'app', memoryBytes: null};
+    const {listeners} = await attachLaunchers(
+      [listener({pid: 711, ppid: 710, port: 4806, task})], [], processes, options({710: '', 711: ended}),
+    );
+    expect(listeners[0]).toMatchObject({leftover: true, launcher: {sessionId: ENDED_SESSION, state: 'ended'}});
+  });
+
+  it('flags browser sessions of an ended launcher even when the browser app is installed', async () => {
     const browser = {
       pid: 800, ppid: 1, name: 'Google Chrome', command: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-pipe',
       executable: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', members: [],
     } as unknown as BrowserSession;
     const result = await attachLaunchers([], [browser, {...browser, pid: 801, ppid: 55}], processes, options({800: ended, 801: ended}));
-    expect(result.browsers.map(({pid, leftover}) => [pid, leftover])).toEqual([[800, true], [801, false]]);
+    expect(result.browsers.map(({pid, leftover}) => [pid, leftover])).toEqual([[800, true], [801, true]]);
   });
 });

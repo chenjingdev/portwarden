@@ -626,6 +626,9 @@ export function getProjectName(details: ListenerDetails): string {
         inferAppFamily(details) ||
         inferProjectNameFromCommand(details);
     }
+    if (segments[0]?.startsWith('.')) {
+      return segments.slice(1).find((segment) => !isGenericProjectDir(segment)) ?? inferProjectNameFromCommand(details);
+    }
     if (PROJECT_ROOT_HINTS.has((segments[0] ?? '').toLowerCase())) {
       return segments[1] ?? inferProjectNameFromCommand(details);
     }

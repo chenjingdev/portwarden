@@ -68,10 +68,10 @@ describe('development task scopes', () => {
     expect(grouped[0]?.task?.blockedReason).toBeTruthy();
   });
   it('recognizes dev launchers by executed command, not incidental words', () => {
-    for (const command of ['npm run dev', '/bin/sh -c node server.js', 'node --watch app.js', 'node /usr/node_modules/nodemon/bin/nodemon.js app.js', 'node /usr/node_modules/npm/bin/npm-cli.js run dev']) {
+    for (const command of ['npm run dev', '/bin/sh -c node server.js', 'node --watch app.js', 'node /usr/node_modules/nodemon/bin/nodemon.js app.js', 'node /usr/node_modules/npm/bin/npm-cli.js run dev', 'npm exec pnpm@11.25.0 dev --host 127.0.0.1 --port 5173', 'node /Users/me/.npm/_npx/f1fade/node_modules/.bin/pnpm dev --port 5173', 'npx vite']) {
       expect(isDevLauncher(proc(100, 1, command)), command).toBe(true);
     }
-    for (const command of ['node agent.js --task next', 'codex exec vite', 'npm install vite', '/bin/sh -c "node server.js & node unrelated.js"']) {
+    for (const command of ['node agent.js --task next', 'codex exec vite', 'npm install vite', 'npm exec eslint .', '/bin/sh -c "node server.js & node unrelated.js"']) {
       expect(isDevLauncher(proc(100, 1, command)), command).toBe(false);
     }
   });

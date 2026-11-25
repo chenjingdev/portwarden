@@ -18,6 +18,7 @@ export interface Launcher {
 
 export interface LauncherTarget {
   pid: number;
+  envPids: readonly number[];
   ppid: number | null;
   cwd: string;
   command: string;
@@ -140,8 +141,8 @@ export function launcherLabel(launcher: Launcher | undefined): string {
   return `${address}${launcher.state === 'ended' ? '✗' : ''}${launcher.name ? ` ${launcher.name}` : ''}`;
 }
 
-export function isLeftover(launcher: Launcher | undefined, target: Pick<LauncherTarget, 'ppid' | 'shared'>): boolean {
-  return launcher?.state === 'ended' && target.ppid === 1 && !target.shared;
+export function isLeftover(launcher: Launcher | undefined, target: Pick<LauncherTarget, 'shared'>): boolean {
+  return launcher?.state === 'ended' && !target.shared;
 }
 
 export async function collectLaunchers(
@@ -150,10 +151,11 @@ export async function collectLaunchers(
   options: LauncherOptions = {},
 ): Promise<Map<number, Launcher>> {
   const home = options.home ?? homedir();
-  const pids = [...new Set(targets.map(({pid}) => pid))];
+  const pids = [...new Set(targets.flatMap(({envPids}) => envPids))];
   const envLines = pids.length === 0 ? new Map<number, string>() : parseEnvLines(await (options.runPsEnv ?? runPsEnv)(pids));
   const identities = new Map(targets.map((target) => {
-    const line = envLines.get(target.pid) ?? '';
+    const line = target.envPids.map((pid) => envLines.get(pid) ?? '')
+      .find((candidate) => SESSION_ID_ENV.test(candidate) || TERMINAL_ENV.test(candidate)) ?? '';
     const temp = CLAUDE_TEMP_PATH.exec(`${target.cwd}\n${target.command}`);
     return [target.pid, {
       sessionId: SESSION_ID_ENV.exec(line)?.[1] ?? temp?.[2],
@@ -200,6 +202,7 @@ export async function attachLaunchers(
     const command = root?.command ?? entry.args;
     return {
       pid: root?.pid ?? entry.pid,
+      envPids: [...new Set([root?.pid ?? entry.pid, entry.pid, ...(entry.task?.members.map(({pid}) => pid) ?? [])])],
       ppid: root ? root.ppid : entry.ppid,
       cwd: root?.cwd ?? entry.cwd,
       command,
@@ -208,7 +211,7 @@ export async function attachLaunchers(
     };
   };
   const browserTarget = (entry: BrowserSession): LauncherTarget => ({
-    pid: entry.pid, ppid: entry.ppid, cwd: entry.cwd ?? '', command: entry.command, executable: entry.executable, shared: false,
+    pid: entry.pid, envPids: [entry.pid], ppid: entry.ppid, cwd: entry.cwd ?? '', command: entry.command, executable: entry.executable, shared: false,
   });
   const listenerTargets = listeners.map(listenerTarget);
   const browserTargets = browsers.map(browserTarget);
