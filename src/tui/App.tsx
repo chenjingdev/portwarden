@@ -363,7 +363,6 @@ export function PortwardenApp({
       {id, identities, phase: 'pending'},
     ]);
     setStatus(`Queued stop: ${target}.`);
-    // Present immediately, but serialize destructive work and config writes.
     stopQueue.current = stopQueue.current.then(async () => {
       try {
         const result = await run();
@@ -375,8 +374,8 @@ export function PortwardenApp({
         updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'failed', error: message} : entry));
         setActionError(message);
       } finally {
-        try { refreshConfig(); } catch { /* Keep the stop outcome visible. */ }
-        try { scanner.refresh(); } catch { /* Retry on the next scan. */ }
+        try { refreshConfig(); } catch {}
+        try { scanner.refresh(); } catch {}
       }
     });
   };

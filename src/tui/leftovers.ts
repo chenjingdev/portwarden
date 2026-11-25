@@ -4,7 +4,6 @@ import type {BrowserSession, ListenerEntry} from '../core/types.js';
 
 export interface LeftoverScope {
   key: string;
-  /** `project:port` for a listener scope, `browser <pid>` for a browser session. */
   label: string;
   launcher: Launcher | undefined;
   memoryBytes: number | null;
@@ -12,7 +11,6 @@ export interface LeftoverScope {
   browser?: BrowserSession;
 }
 
-/** One entry per stop scope: a task, a standalone PID, or a browser session. */
 export function collectLeftovers(
   allListeners: readonly ListenerEntry[],
   browsers: readonly BrowserSession[],

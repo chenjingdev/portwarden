@@ -36,7 +36,7 @@ const hcTerminals = JSON.stringify({terminals: [
 
 function target(overrides: Partial<LauncherTarget> = {}): LauncherTarget {
   const pid = overrides.pid ?? 500;
-  return {pid, envPids: [pid], ppid: 1, cwd: '/Users/test/dev/app', command: 'python3 -m http.server 4801', executable: '', shared: false, ...overrides};
+  return {pid, envPids: [pid], ppid: 1, cwd: '/Users/test/dev/app', command: 'python3 -m http.server 4801', executable: '', sharedInstall: false, ...overrides};
 }
 
 function options(env: Record<number, string>, extra: Partial<LauncherOptions> = {}): LauncherOptions {

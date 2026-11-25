@@ -8,9 +8,7 @@ import {getProjectName, interpreterShortName, resolveClaudeSlug, shellTokens} fr
 import type {BrowserSession, ListenerEntry, ProcessInfo} from './types.js';
 
 export interface Launcher {
-  /** Claude conversation id. */
   sessionId?: string;
-  /** hc terminal address. */
   terminal?: string;
   name?: string;
   state: 'live' | 'ended';
@@ -23,8 +21,7 @@ export interface LauncherTarget {
   cwd: string;
   command: string;
   executable: string;
-  /** Programs installed for shared use are never leftovers of whoever started them. */
-  shared: boolean;
+  sharedInstall: boolean;
 }
 
 export interface LauncherOptions {
@@ -118,8 +115,7 @@ function scriptPath(argv: readonly string[]): string {
   return argv.slice(1).find((token) => !token.startsWith('-')) ?? '';
 }
 
-/** The program a process runs: an interpreter is judged by its script, never by where it is installed. */
-function programPath(executable: string, command: string): string {
+function scriptOrBinaryPath(executable: string, command: string): string {
   const argv = shellTokens(command);
   const binary = executable || argv[0] || '';
   return interpreterShortName(binary) ? scriptPath(argv) : binary;
@@ -130,19 +126,18 @@ function isUnder(target: string, roots: readonly string[]): boolean {
 }
 
 export function isInstalledProgram(executable: string, command: string, home = homedir()): boolean {
-  const program = programPath(executable, command);
+  const program = scriptOrBinaryPath(executable, command);
   return isUnder(program, INSTALLED_PROGRAM_ROOTS(home)) && !isUnder(program, CACHE_ROOTS(home));
 }
 
-/** `<terminal or session id prefix>[✗] <name>`, where ✗ marks an ended launcher. */
 export function launcherLabel(launcher: Launcher | undefined): string {
   if (!launcher) return '-';
   const address = launcher.terminal ?? launcher.sessionId?.slice(0, 8) ?? '-';
   return `${address}${launcher.state === 'ended' ? '✗' : ''}${launcher.name ? ` ${launcher.name}` : ''}`;
 }
 
-export function isLeftover(launcher: Launcher | undefined, target: Pick<LauncherTarget, 'shared'>): boolean {
-  return launcher?.state === 'ended' && !target.shared;
+export function isLeftover(launcher: Launcher | undefined, target: Pick<LauncherTarget, 'sharedInstall'>): boolean {
+  return launcher?.state === 'ended' && !target.sharedInstall;
 }
 
 export async function collectLaunchers(
@@ -188,7 +183,6 @@ export async function collectLaunchers(
   return launchers;
 }
 
-/** Resolve every row's launcher with one ps, one sessions read, and one hc call. */
 export async function attachLaunchers(
   listeners: readonly ListenerEntry[],
   browsers: readonly BrowserSession[],
@@ -207,11 +201,11 @@ export async function attachLaunchers(
       cwd: root?.cwd ?? entry.cwd,
       command,
       executable,
-      shared: isInstalledProgram(executable, command, home),
+      sharedInstall: isInstalledProgram(executable, command, home),
     };
   };
   const browserTarget = (entry: BrowserSession): LauncherTarget => ({
-    pid: entry.pid, envPids: [entry.pid], ppid: entry.ppid, cwd: entry.cwd ?? '', command: entry.command, executable: entry.executable, shared: false,
+    pid: entry.pid, envPids: [entry.pid], ppid: entry.ppid, cwd: entry.cwd ?? '', command: entry.command, executable: entry.executable, sharedInstall: false,
   });
   const listenerTargets = listeners.map(listenerTarget);
   const browserTargets = browsers.map(browserTarget);

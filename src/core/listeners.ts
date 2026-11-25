@@ -639,7 +639,6 @@ export function getProjectName(details: ListenerDetails): string {
   return isGenericProjectDir(basename) ? inferProjectNameFromCommand(details) || basename : basename;
 }
 
-/** Claude names a temp folder after the original cwd with every non-alphanumeric character replaced by `-`. */
 export function resolveClaudeSlug(slug: string, root: string = path.sep): string {
   let directory = root;
   let rest = slug.replace(/^-/, '');
@@ -856,7 +855,6 @@ function parsePnpmDlxCommand(input: string): {packageName: string; trailingArgs:
   return packageName ? {packageName, trailingArgs: tokens.slice(index + 1).join(' ')} : null;
 }
 
-/** The short name of an interpreter executable such as node or python3, or undefined for any other program. */
 export function interpreterShortName(executable: string): string | undefined {
   for (const {pattern, name} of INTERPRETER_SHORT_NAMES) {
     const match = pattern.exec(executable);
