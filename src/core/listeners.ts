@@ -114,7 +114,7 @@ const INSTALLED_PROJECT_PATTERNS: readonly RegExp[] = [
 
 const INTERPRETER_SHORT_NAMES: readonly {pattern: RegExp; name?: string}[] = [
   {pattern: /(?:^|\/)Python\.app\/Contents\/MacOS\/Python$/, name: 'python3'},
-  {pattern: /(?:^|\/)(node|nodejs|bun|deno|ruby|php|python\d*(?:\.\d+)*)$/},
+  {pattern: /(?:^|\/)(node|nodejs|bun|deno|ruby|php|bash|sh|zsh|python\d*(?:\.\d+)*)$/},
 ];
 
 const CLAUDE_TEMP_CWD = /^\/(?:private\/)?tmp\/claude-\d+\/([^/]+)(?:\/|$)/;

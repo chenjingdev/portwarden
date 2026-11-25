@@ -34,6 +34,7 @@ export interface LauncherOptions {
 interface ClaudeSession {
   sessionId: string;
   pid: number;
+  procStart?: string;
   name?: string;
 }
 
@@ -44,8 +45,12 @@ interface HcTerminal {
   state: string;
 }
 
-const SESSION_ID_ENV = /\bCLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/;
-const TERMINAL_ENV = /\bHC_TERMINAL_ID=(\S+)/;
+const SESSION_ID_ENV = /\bCLAUDE_CODE_SESSION_ID=([0-9a-f-]{36})/g;
+const TERMINAL_ENV = /\bHC_TERMINAL_ID=(\S+)/g;
+
+function lastEnvValue(pattern: RegExp, line: string): string | undefined {
+  return [...line.matchAll(pattern)].at(-1)?.[1];
+}
 const CLAUDE_TEMP_PATH = /\/tmp\/claude-\d+\/([^/\s]+)\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=\/|\s|$)/;
 
 const INSTALLED_PROGRAM_ROOTS = (home: string): readonly string[] => [
@@ -53,6 +58,7 @@ const INSTALLED_PROGRAM_ROOTS = (home: string): readonly string[] => [
   '/Applications',
   path.join(home, 'Applications'),
   path.join(home, 'Library'),
+  path.join(home, '.local'),
   '/System',
   '/Library',
 ];
@@ -115,18 +121,20 @@ function scriptPath(argv: readonly string[]): string {
   return argv.slice(1).find((token) => !token.startsWith('-')) ?? '';
 }
 
-function scriptOrBinaryPath(executable: string, command: string): string {
+function scriptOrBinaryPath(executable: string, command: string, cwd: string): string {
   const argv = shellTokens(command);
   const binary = executable || argv[0] || '';
-  return interpreterShortName(binary) ? scriptPath(argv) : binary;
+  if (!interpreterShortName(binary)) return binary;
+  const script = scriptPath(argv);
+  return script && cwd ? path.resolve(cwd, script) : script;
 }
 
 function isUnder(target: string, roots: readonly string[]): boolean {
   return roots.some((root) => target === root || target.startsWith(`${root}${path.sep}`));
 }
 
-export function isInstalledProgram(executable: string, command: string, home = homedir()): boolean {
-  const program = scriptOrBinaryPath(executable, command);
+export function isInstalledProgram(executable: string, command: string, cwd: string, home = homedir()): boolean {
+  const program = scriptOrBinaryPath(executable, command, cwd);
   return isUnder(program, INSTALLED_PROGRAM_ROOTS(home)) && !isUnder(program, CACHE_ROOTS(home));
 }
 
@@ -150,27 +158,27 @@ export async function collectLaunchers(
   const envLines = pids.length === 0 ? new Map<number, string>() : parseEnvLines(await (options.runPsEnv ?? runPsEnv)(pids));
   const identities = new Map(targets.map((target) => {
     const line = target.envPids.map((pid) => envLines.get(pid) ?? '')
-      .find((candidate) => SESSION_ID_ENV.test(candidate) || TERMINAL_ENV.test(candidate)) ?? '';
+      .find((candidate) => lastEnvValue(SESSION_ID_ENV, candidate) || lastEnvValue(TERMINAL_ENV, candidate)) ?? '';
     const temp = CLAUDE_TEMP_PATH.exec(`${target.cwd}\n${target.command}`);
     return [target.pid, {
-      sessionId: SESSION_ID_ENV.exec(line)?.[1] ?? temp?.[2],
-      terminal: TERMINAL_ENV.exec(line)?.[1],
+      sessionId: lastEnvValue(SESSION_ID_ENV, line) ?? temp?.[2],
+      terminal: lastEnvValue(TERMINAL_ENV, line),
       slug: temp?.[1],
     }] as const;
   }));
   const needsTerminals = [...identities.values()].some(({terminal}) => terminal);
   const sessions = readSessions(options.sessionsDirectory ?? path.join(home, '.claude', 'sessions'));
   const terminals = needsTerminals ? parseHcTerminals(await (options.runHc ?? runHc)()) : new Map<string, HcTerminal>();
-  const livePids = new Set(processes.map(({pid}) => pid));
+  const startByPid = new Map(processes.map(({pid, startTime}) => [pid, startTime?.getTime()]));
+  const sessionAlive = (session: ClaudeSession): boolean => startByPid.has(session.pid) &&
+    (!session.procStart || new Date(session.procStart).getTime() === startByPid.get(session.pid));
 
   const launchers = new Map<number, Launcher>();
   for (const [pid, {sessionId, terminal, slug}] of identities) {
     if (!sessionId && !terminal) continue;
     const session = sessionId ? sessions.get(sessionId) : undefined;
     const hc = terminal ? terminals.get(terminal) : undefined;
-    const live = sessionId
-      ? Boolean(session && livePids.has(session.pid))
-      : hc?.state === 'live';
+    const live = Boolean(session && sessionAlive(session)) || hc?.state === 'live';
     const name = hc?.name ?? hc?.where ?? session?.name ??
       (slug ? getProjectName({cwd: resolveClaudeSlug(slug), command: '', args: '', home}) : undefined);
     launchers.set(pid, {
@@ -201,7 +209,7 @@ export async function attachLaunchers(
       cwd: root?.cwd ?? entry.cwd,
       command,
       executable,
-      sharedInstall: isInstalledProgram(executable, command, home),
+      sharedInstall: isInstalledProgram(executable, command, root?.cwd ?? entry.cwd, home),
     };
   };
   const browserTarget = (entry: BrowserSession): LauncherTarget => ({
