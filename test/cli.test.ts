@@ -97,7 +97,7 @@ async function waitForLines(subprocess: ResultPromise, count: number): Promise<s
     }, 5_000);
     const onData = (chunk: string) => {
       buffer += chunk;
-      const lines = buffer.split(/\r?\n/).filter(Boolean);
+      const lines = buffer.split(/\r?\n/).slice(0, -1).filter(Boolean);
       if (lines.length >= count) {
         cleanup();
         resolve(lines.slice(0, count));
