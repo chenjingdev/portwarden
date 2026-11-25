@@ -1307,14 +1307,15 @@ function tableWidths(columns: number, showKind: boolean): number[] {
     return [kind, 3, 5, 6, 8, 0, 14, 0, process];
   }
   const usable = Math.max(80, columns - 2);
-  const kind = showKind ? 6 : 0;
+  const wide = columns >= 150;
+  const kind = showKind ? (wide ? 7 : 6) : 0;
   const pin = 3;
   const port = 5;
   const pid = 6;
-  const age = 8;
-  const host = Math.max(10, Math.floor(usable * 0.14));
-  const project = Math.max(16, Math.floor(usable * 0.18));
-  const by = columns < 110 ? 0 : 16;
+  const age = wide ? 10 : 8;
+  const host = wide ? 15 : Math.max(10, Math.floor(usable * 0.14));
+  const project = wide ? Math.min(28, Math.floor(usable * 0.14)) : Math.max(16, Math.floor(usable * 0.18));
+  const by = columns < 110 ? 0 : wide ? Math.min(26, Math.floor(usable * 0.12)) : 16;
   const fixed = kind + pin + port + pid + age + host + project + by;
   const spaces = (showKind ? 8 : 7) + (by ? 1 : 0);
   const process = Math.max(24, usable - fixed - spaces);
