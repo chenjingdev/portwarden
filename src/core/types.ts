@@ -79,6 +79,8 @@ export interface ListenerEntry {
   displayCommand: string;
   displayCwd: string;
   startTime?: Date;
+  /** Resident memory of this process in bytes, when the OS reported it. */
+  rssBytes?: number;
   /** Who started the stop scope root: the task root for a task, otherwise this PID. */
   launcher?: Launcher;
   /** The launcher has ended, the scope root is orphaned, and the program is not installed for shared use. */

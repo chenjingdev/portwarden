@@ -15,7 +15,9 @@ import {
 import {listenerKey, listenerKeys, preferenceKey, selectionKey} from '../core/listeners.js';
 import type {ListenerEntry} from '../core/types.js';
 import {formatMemory} from '../core/browserSessions.js';
+import {launcherLabel, type Launcher} from '../core/launchers.js';
 import {normalizeShortcut} from './keymap.js';
+import {collectLeftovers, leftoverLine, type LeftoverScope} from './leftovers.js';
 import {buildVisibleRows, listenerIsPinned, type VisibleRow} from './rows.js';
 import {useScanner} from './useScanner.js';
 import {failedRowsLast, processIdentity, rowIdentities, type StopPresentation} from './optimisticStops.js';
@@ -25,6 +27,7 @@ type Screen = 'main' | 'settings' | 'browser' | 'graveyard' | 'help';
 interface Confirmation {
   title: string;
   detail: string;
+  lines?: string[];
   action: () => Promise<unknown>;
 }
 
@@ -38,6 +41,7 @@ export interface PortwardenAppProps {
 }
 
 const REFRESH_INTERVALS = [1, 2, 5, 10];
+const MAX_LEFTOVER_LINES = 8;
 
 export function PortwardenApp({
   configRepository,
@@ -119,6 +123,10 @@ export function PortwardenApp({
     const next = stopsRef.current.filter((entry) => entry.phase === 'pending' || entry.identities.some((id) => live.has(id)));
     if (next.length !== stopsRef.current.length) updateStops(next);
   }, [scanner.allListeners, scanner.browsers, scanner.zombies]);
+  const leftovers = useMemo(
+    () => collectLeftovers(scanner.allListeners, scanner.browsers ?? []),
+    [scanner.allListeners, scanner.browsers],
+  );
   const selectedIndex = selectedKey ? visibleRows.findIndex(({key}) => key === selectedKey) : -1;
   const effectiveSelectedIndex = visibleRows.length === 0
     ? -1
@@ -127,7 +135,7 @@ export function PortwardenApp({
       : clamp(selectionIndexHint.current, 0, visibleRows.length - 1);
   const selectedRow = effectiveSelectedIndex >= 0 ? visibleRows[effectiveSelectedIndex] ?? null : null;
   const filterLineCount = filterMode || query ? 1 : 0;
-  const mainPageSize = Math.max(1, terminalRows - 15 - filterLineCount);
+  const mainPageSize = Math.max(1, terminalRows - 16 - filterLineCount - (confirmation?.lines?.length ?? 0));
 
   useEffect(() => {
     if (selectedIndex >= 0) {
@@ -226,12 +234,12 @@ export function PortwardenApp({
     }
   };
 
-  const queueAction = (title: string, detail: string, action: () => Promise<unknown>) => {
+  const queueAction = (title: string, detail: string, action: () => Promise<unknown>, lines?: string[]) => {
     if (actionInFlight.current) return;
     setActionError('');
     setActionWarning('');
     if (config.confirmActions) {
-      setConfirmation({title, detail, action});
+      setConfirmation({title, detail, action, lines});
     } else {
       void action();
     }
@@ -345,6 +353,34 @@ export function PortwardenApp({
     return true;
   };
 
+  const isStopQueued = (identities: readonly string[]) =>
+    stopsRef.current.some((entry) => entry.phase !== 'failed' && entry.identities.some((id) => identities.includes(id)));
+
+  const enqueueStop = (identities: string[], target: string, run: () => Promise<{message: string; warning?: string}>) => {
+    const id = ++stopSequence.current;
+    updateStops([
+      ...stopsRef.current.filter((entry) => !entry.identities.some((identity) => identities.includes(identity))),
+      {id, identities, phase: 'pending'},
+    ]);
+    setStatus(`Queued stop: ${target}.`);
+    // Present immediately, but serialize destructive work and config writes.
+    stopQueue.current = stopQueue.current.then(async () => {
+      try {
+        const result = await run();
+        updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'stopped'} : entry));
+        setStatus(result.message);
+        setActionWarning(result.warning ?? '');
+      } catch (error) {
+        const message = errorMessage(error);
+        updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'failed', error: message} : entry));
+        setActionError(message);
+      } finally {
+        try { refreshConfig(); } catch { /* Keep the stop outcome visible. */ }
+        try { scanner.refresh(); } catch { /* Retry on the next scan. */ }
+      }
+    });
+  };
+
   const stopSelected = (signal: StopSignal) => {
     if (!selectedRow || selectedRow.type === 'group') {
       setActionError(selectedRow ? 'Expand the group and select one process first.' : 'No process selected.');
@@ -383,8 +419,7 @@ export function PortwardenApp({
       async () => {
         // The ref closes the gap before React commits the hidden row, preventing
         // repeated input from queueing the same scope twice.
-        if (stopsRef.current.some((entry) => entry.phase !== 'failed' && entry.identities.some((id) => identities.includes(id)))) return;
-        const id = ++stopSequence.current;
+        if (isStopQueued(identities)) return;
         const remaining = visibleRows.filter((row) => !rowIdentities(row).some((identity) => identities.includes(identity)));
         pendingSelectionKey.current = null;
         const precedingCount = visibleRows.slice(0, effectiveSelectedIndex)
@@ -392,30 +427,53 @@ export function PortwardenApp({
         const nextIndex = Math.min(precedingCount, remaining.length - 1);
         selectionIndexHint.current = Math.max(0, nextIndex);
         setSelectedKey(remaining[nextIndex]?.key ?? null);
-        updateStops([
-          ...stopsRef.current.filter((entry) => !entry.identities.some((identity) => identities.includes(identity))),
-          {id, identities, phase: 'pending'},
-        ]);
-        setStatus(`Queued stop: ${target}.`);
-        // Present immediately, but serialize destructive work and config writes.
-        stopQueue.current = stopQueue.current.then(async () => {
-          try {
-            const result = listener ? await actions.stopListener(listener, signal)
-              : selectedRow.type === 'browser' ? await actions.stopBrowser(selectedRow.browser, signal)
-                : selectedRow.type === 'zombie' ? await actions.stopZombie(selectedRow.zombie, signal) : {message: 'No process selected.'};
-            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'stopped'} : entry));
-            setStatus(result.message);
-            setActionWarning(result.warning ?? '');
-          } catch (error) {
-            const message = errorMessage(error);
-            updateStops(stopsRef.current.map((entry) => entry.id === id ? {...entry, phase: 'failed', error: message} : entry));
-            setActionError(message);
-          } finally {
-            try { refreshConfig(); } catch { /* Keep the stop outcome visible. */ }
-            try { scanner.refresh(); } catch { /* Retry on the next scan. */ }
-          }
-        });
+        enqueueStop(identities, target, async () => listener ? await actions.stopListener(listener, signal)
+          : selectedRow.type === 'browser' ? await actions.stopBrowser(selectedRow.browser, signal)
+            : selectedRow.type === 'zombie' ? await actions.stopZombie(selectedRow.zombie, signal) : {message: 'No process selected.'});
       },
+    );
+  };
+
+  const stopLeftovers = () => {
+    const leftovers = collectLeftovers(scanner.allListeners, scanner.browsers ?? []);
+    if (leftovers.length === 0) {
+      setActionError('');
+      setStatus('No leftovers.');
+      return;
+    }
+    const identitiesOf = (scope: LeftoverScope) => scope.listener
+      ? [...new Set([
+        ...(scope.listener.task?.members ?? [scope.listener]).map(processIdentity),
+        ...scanner.allListeners.filter((entry) => listenerSharesStopScope(scope.listener!, entry)).map(processIdentity),
+      ])]
+      : scope.browser!.members.map(processIdentity);
+    const pinnedScope = (scope: LeftoverScope) => scope.listener !== undefined && scanner.allListeners.some((entry) =>
+      listenerSharesStopScope(scope.listener!, entry) && listenerIsPinned(entry, config.pinnedListenerKeys));
+    const stoppable = leftovers.filter((scope) => !pinnedScope(scope) && !isStopQueued(identitiesOf(scope)));
+    if (stoppable.length === 0) {
+      setActionError('Every leftover is pinned or already being stopped.');
+      return;
+    }
+    const memory = stoppable.every(({memoryBytes}) => memoryBytes !== null)
+      ? stoppable.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null;
+    const skipped = leftovers.length - stoppable.length;
+    const listed = stoppable.slice(0, MAX_LEFTOVER_LINES).map(leftoverLine);
+    if (stoppable.length > listed.length) listed.push(`… and ${stoppable.length - listed.length} more`);
+    if (skipped > 0) listed.push(`${skipped} pinned or already stopping skipped`);
+    queueAction(
+      `Stop ${stoppable.length} leftover${stoppable.length === 1 ? '' : 's'} (${formatMemory(memory)} RSS)?`,
+      'SIGTERM to exactly these scopes.',
+      async () => {
+        pendingSelectionKey.current = null;
+        for (const scope of stoppable) {
+          const identities = identitiesOf(scope);
+          if (isStopQueued(identities)) continue;
+          enqueueStop(identities, scope.label, async () => scope.listener
+            ? await actions.stopListener(scope.listener, 'SIGTERM')
+            : await actions.stopBrowser(scope.browser!, 'SIGTERM'));
+        }
+      },
+      listed,
     );
   };
 
@@ -612,6 +670,8 @@ export function PortwardenApp({
       stopSelected('SIGTERM');
     } else if (normalized === 'f') {
       stopSelected('SIGKILL');
+    } else if (normalized === 'l') {
+      stopLeftovers();
     } else if (normalized === 'g') {
       pendingSelectionKey.current = null;
       refreshConfig();
@@ -700,6 +760,8 @@ export function PortwardenApp({
         hiddenCount={all ? 0 : Math.max(0, scanner.allListeners.length - scanner.listeners.length)}
         zombieCount={scanner.zombies.length}
         browserCount={scanner.browsers?.length ?? 0}
+        leftoverCount={leftovers.length}
+        leftoverMemory={leftovers.every(({memoryBytes}) => memoryBytes !== null) ? leftovers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null}
         browserMemory={scanner.browsers?.every(({memoryBytes}) => memoryBytes !== null) ? scanner.browsers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null}
         selectedIndex={effectiveSelectedIndex}
         browser={normalizedBrowserOverride || config.browser}
@@ -743,6 +805,8 @@ function MainHeader(props: {
   zombieCount: number;
   browserCount: number;
   browserMemory: number | null;
+  leftoverCount: number;
+  leftoverMemory: number | null;
   selectedIndex: number;
   browser: string;
   loading: boolean;
@@ -757,6 +821,7 @@ function MainHeader(props: {
         PORTWARDEN  <Text color={props.all ? 'cyan' : 'green'}>[{props.all ? 'ALL' : 'MAIN'}]</Text>{' '}
         <Text color="white">[{props.listenerCount} port{props.listenerCount === 1 ? '' : 's'}]</Text>{' '}
         {props.browserCount > 0 ? <Text color="magenta">[{props.browserCount} browsers · {formatMemory(props.browserMemory)} RSS] </Text> : null}
+        {props.leftoverCount > 0 ? <Text color="yellow">[{props.leftoverCount} leftovers · {formatMemory(props.leftoverMemory)} RSS] </Text> : null}
         {props.all && props.rowCount !== props.listenerCount ? <Text color="gray">[{props.rowCount} rows] </Text> : null}
         {!props.all && props.hiddenCount > 0 ? <Text color="yellow">[hidden {props.hiddenCount}] </Text> : null}
         {props.showZombies ? <Text color={props.zombieCount ? 'red' : 'gray'}>[{props.zombieCount} zombies]</Text> : null}
@@ -790,7 +855,7 @@ function MainTable(props: {
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text><Text bold>PORTS + DEV BROWSERS</Text>  <Text dimColor>{showing}</Text></Text>
-      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST / RAM', 'PROJECT', 'PROCESS']} widths={widths} columns={props.columns} header />
+      <TableRow values={['KIND', 'PIN', 'PORT', 'PID', 'AGE', 'HOST / RAM', 'PROJECT', 'BY', 'PROCESS']} widths={widths} columns={props.columns} header />
       <Text dimColor>{'-'.repeat(Math.max(1, props.columns - 1))}</Text>
       {visible.length === 0 ? (
         <Text color="yellow">  {props.all ? 'No LISTEN ports or dev browsers found.' : 'No relevant ports or dev browsers found.'}</Text>
@@ -824,8 +889,8 @@ function DataRow({row, selected, widths, config, columns, failed}: {
     const ports = [...new Set(row.members.map(({port}) => port))];
     return <TableRow failed={failed}
       values={[task ? 'TASK' : 'PID', row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'Y' : '-', `${ports.length}x`, String(task?.root.pid ?? listener.pid), listener.elapsed,
-        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
-      widths={widths} columns={columns} selected={selected} color="cyan"
+        task ? formatMemory(task.memoryBytes) : listener.displayHost, `${row.expanded ? 'v ' : '> '}${row.family}`, launcherLabel(listener.launcher), `ports ${ports.join(', ')} · ${task ? `${task.members.length} processes` : 'one process'}`]}
+      widths={widths} columns={columns} selected={selected} color={listener.leftover ? 'yellow' : 'cyan'}
     />;
   }
   if (row.type === 'group') {
@@ -840,6 +905,7 @@ function DataRow({row, selected, widths, config, columns, failed}: {
           '-',
           hosts,
           `${row.expanded ? 'v ' : '> '}${row.family}`,
+          '-',
           row.expanded ? `open · ${row.members.length} listeners · enter collapse` : `closed · ${row.members.length} listeners`,
         ]}
         widths={widths}
@@ -852,7 +918,7 @@ function DataRow({row, selected, widths, config, columns, failed}: {
   if (row.type === 'zombie') {
     return (
       <TableRow failed={failed}
-        values={['ZOMBIE', '-', '-', String(row.zombie.pid), formatSeconds(row.zombie.ageSeconds), '-', row.zombie.family, redactCommandLine(row.zombie.command)]}
+        values={['ZOMBIE', '-', '-', String(row.zombie.pid), formatSeconds(row.zombie.ageSeconds), '-', row.zombie.family, '-', redactCommandLine(row.zombie.command)]}
         widths={widths}
         columns={columns}
         selected={selected}
@@ -863,9 +929,9 @@ function DataRow({row, selected, widths, config, columns, failed}: {
   if (row.type === 'browser') {
     const browser = row.browser;
     return <TableRow failed={failed}
-      values={['BROWSER', '-', '-', String(browser.pid), formatSeconds(browser.ageSeconds), formatMemory(browser.memoryBytes), browser.family,
+      values={['BROWSER', '-', '-', String(browser.pid), formatSeconds(browser.ageSeconds), formatMemory(browser.memoryBytes), browser.family, launcherLabel(browser.launcher),
         `${formatMemory(browser.memoryBytes)} · ${browser.members.length} procs · ${browser.name}`]}
-      widths={widths} columns={columns} selected={selected} color="magenta"
+      widths={widths} columns={columns} selected={selected} color={browser.leftover ? 'yellow' : 'magenta'}
     />;
   }
   const pinned = listenerIsPinned(row.listener, config.pinnedListenerKeys);
@@ -879,12 +945,13 @@ function DataRow({row, selected, widths, config, columns, failed}: {
         row.listener.elapsed,
         row.listener.displayHost,
         `${row.depth ? '| ' : ''}${row.listener.displayProject || '-'}`,
+        launcherLabel(row.listener.launcher),
         `${row.depth ? '| ' : ''}${redactCommandLine(row.listener.displayCommand || row.listener.args)}`,
       ]}
       widths={widths}
       columns={columns}
       selected={selected}
-      color={undefined}
+      color={row.listener.leftover ? 'yellow' : undefined}
     />
   );
 }
@@ -900,7 +967,7 @@ function TableRow({values, widths, columns, selected = false, header = false, co
 }) {
   const cells = values.flatMap((value, index) => {
     const width = widths[index] ?? 0;
-    return width > 0 ? [padDisplayText(sanitizeText(failed && index === 7 ? `FAILED · ${value}` : value), width)] : [];
+    return width > 0 ? [padDisplayText(sanitizeText(failed && index === 8 ? `FAILED · ${value}` : value), width)] : [];
   });
   const line = truncateDisplayText(`${selected ? '>' : ' '} ${cells.join(' ')}`, columns);
   return <Text bold={header} dimColor={header} inverse={selected} color={failed ? 'red' : color}>{line}</Text>;
@@ -935,13 +1002,14 @@ function detailLines(
   row: VisibleRow | null,
   config: PortwardenConfig,
   listeners: readonly ListenerEntry[],
-): [string, string, string, string, string] {
-  if (!row) return ['No process selected.', '', '', '', ''];
+): [string, string, string, string, string, string] {
+  if (!row) return ['No process selected.', '', '', '', '', ''];
   if (row.type === 'process') {
     const listener = row.members[0]!;
     const task = listener.task;
     if (task) return [
       `task ${task.root.pid}  ${task.members.length} processes  RAM ${formatMemory(task.memoryBytes)} RSS sum  ports ${task.ports.join(', ')}`,
+      launcherDetail(listener.launcher, task.root.ppid),
       `stops PIDs ${task.members.map(({pid}) => pid).join(', ')}  including launcher + workers`,
       task.blockedReason || `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire task protected' : 'NO'}  dir ${sanitizeText(task.root.cwd)}`,
       `cmd ${redactCommandLine(task.root.command)}`,
@@ -949,6 +1017,7 @@ function detailLines(
     ];
     return [
       `pid ${listener.pid}  ${row.members.length} listeners share one process  age ${listener.elapsed}`,
+      launcherDetail(listener.launcher, listener.ppid),
       `stopping this PID closes ALL ports: ${[...new Set(row.members.map(({port}) => port))].join(', ')}`,
       `pin ${row.members.some((entry) => listenerIsPinned(entry, config.pinnedListenerKeys)) ? 'YES — entire PID protected' : 'NO'}  dir ${sanitizeText(listener.displayCwd)}`,
       `cmd ${redactCommandLine(listener.args)}`,
@@ -961,6 +1030,7 @@ function detailLines(
     const ports = [...new Set(listeners.filter(({pid}) => pids.has(pid)).map(({port}) => port))];
     return [
       `pid ${browser.pid}  RAM ${formatMemory(browser.memoryBytes)} RSS sum  processes ${browser.members.length}  age ${formatSeconds(browser.ageSeconds)}`,
+      launcherDetail(browser.launcher, browser.ppid),
       `parent ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState}; activity unknown)  ports ${ports.join(', ') || 'none'}`,
       `profile ${sanitizeText(browser.profile) || '-'}  reason ${browser.reason}`,
       `proc ${redactCommandLine(browser.command)}`,
@@ -973,6 +1043,7 @@ function detailLines(
     const commands = [...new Set(row.members.map(({displayCommand}) => redactCommandLine(displayCommand)).filter(Boolean))];
     return [
       `group ${row.family}  kind APP  listeners ${row.members.length}  state ${row.expanded ? 'expanded' : 'collapsed'}`,
+      '',
       `ports ${ports.slice(0, 5).join(', ')}${ports.length > 5 ? ` +${ports.length - 5}` : ''}  host ${hosts.join(', ') || '-'}`,
       `apps ${commands.slice(0, 4).join(' · ') || '-'}`,
       `hint enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  choose a listener to open, move, or stop`,
@@ -982,6 +1053,7 @@ function detailLines(
   if (row.type === 'zombie') {
     return [
       `pid ${row.zombie.pid}  ppid ${row.zombie.ppid}  kind ZOMBIE  age ${formatSeconds(row.zombie.ageSeconds)}  reapable ${row.zombie.reapable ? 'YES' : 'NO'}`,
+      '',
       `family ${row.zombie.family}`,
       `reason ${sanitizeText(row.zombie.reason) || '-'}`,
       `proc ${redactCommandLine(row.zombie.command)}`,
@@ -992,6 +1064,7 @@ function detailLines(
   const duplicateCount = listeners.filter(({port}) => port === row.listener.port).length;
   return [
     `port ${row.listener.port}  pid ${row.listener.pid}  kind ${row.listener.kind.toUpperCase()}  age ${row.listener.elapsed}  pin ${pinned ? 'YES' : 'NO'}`,
+    launcherDetail(row.listener.launcher, row.listener.task ? row.listener.task.root.ppid : row.listener.ppid),
     row.listener.task
       ? `stop scope TASK ${row.listener.task.root.pid}, ${row.listener.task.members.length} processes, ports ${row.listener.task.ports.join(', ')}`
       : `stop scope PID ${row.listener.pid}, ports ${[...new Set(listeners.filter(({pid}) => pid === row.listener.pid).map(({port}) => port))].join(', ')}  next ${nextAvailablePort(listeners, row.listener.port)}  dup ${duplicateCount > 1 ? `${duplicateCount} in use` : 'none'}`,
@@ -999,6 +1072,13 @@ function detailLines(
     `dir  ${sanitizeText(row.listener.displayCwd || row.listener.cwd) || '-'}`,
     `cmd  ${redactCommandLine(row.listener.displayCommand || row.listener.args) || '-'}`,
   ];
+}
+
+function launcherDetail(launcher: Launcher | undefined, ppid: number | null): string {
+  const parent = ppid === 1 ? 'orphan' : `parent ${ppid ?? '-'}`;
+  if (!launcher) return `by unknown launcher · ${parent}`;
+  const label = [launcher.terminal ?? '-', launcher.name].filter(Boolean).join(' ');
+  return `by ${label} (${launcher.state}) session ${launcher.sessionId?.slice(0, 8) ?? '-'} · ${parent}`;
 }
 
 function StatusLine({busy, status, error, warning = ''}: {busy: string; status: string; error: string; warning?: string}) {
@@ -1012,24 +1092,27 @@ function StatusLine({busy, status, error, warning = ''}: {busy: string; status: 
 
 function ConfirmationBox({confirmation}: {confirmation: Confirmation}) {
   return (
-    <Text color="yellow" wrap="truncate-end">
-      confirm  {sanitizeText(confirmation.title)}  enter/y confirm  esc/n cancel  {sanitizeText(confirmation.detail)}
-    </Text>
+    <Box flexDirection="column">
+      {confirmation.lines?.map((line, index) => <Text key={index} color="yellow" wrap="truncate-end">  {sanitizeText(line)}</Text>)}
+      <Text color="yellow" wrap="truncate-end">
+        confirm  {sanitizeText(confirmation.title)}  enter/y confirm  esc/n cancel  {sanitizeText(confirmation.detail)}
+      </Text>
+    </Box>
   );
 }
 
 function ShortcutLine({row, columns}: {row: VisibleRow | null; columns: number}) {
   const shortcuts = row?.type === 'browser'
-    ? 'x stop browser + helpers  f force-stop  a all/main  / filter  r refresh  ? help  q quit'
+    ? 'x stop browser + helpers  f force-stop  l leftovers  a all/main  / filter  r refresh  ? help  q quit'
     : row?.type === 'process'
-      ? 'enter expand/collapse  p pin group  x stop whole group  f force-stop  ↑/↓ select  / filter  q quit'
+      ? 'enter expand/collapse  p pin group  x stop whole group  f force-stop  l leftovers  ↑/↓ select  / filter  q quit'
     : row?.type === 'group'
-    ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  a all/main  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
+    ? `${row.expanded ? '← collapse' : '→ expand'}  enter ${row.expanded ? 'collapse' : 'expand'}  p pin group  a all/main  l leftovers  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help`
     : row?.type === 'listener' && row.parentGroupKey
-      ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
+      ? '← collapse  m move-port  o open  p pin  x stop  f force-stop  l leftovers  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help'
       : row?.type === 'zombie'
-        ? 'x stop  f force-stop  a all/main  g graveyard  s settings  q quit  z hide-zombies  / filter  r refresh  ? help'
-        : '←/→ reorder  a all/main  m move-port  o open  p pin  x stop  f force-stop  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help';
+        ? 'x stop  f force-stop  l leftovers  a all/main  g graveyard  s settings  q quit  z hide-zombies  / filter  r refresh  ? help'
+        : '←/→ reorder  a all/main  m move-port  o open  p pin  x stop  f force-stop  l leftovers  g graveyard  s settings  q quit  z zombies  / filter  r refresh  ? help';
   return <Text dimColor wrap="truncate-end">{truncateRawText(`keys: ${shortcuts}`, columns)}</Text>;
 }
 
@@ -1184,6 +1267,7 @@ function HelpScreen() {
       <Text>p        pin/unpin a listener or group (pinned listeners cannot be stopped)</Text>
       <Text>o / m    open in browser / safely move to the next verified port</Text>
       <Text>x / f    SIGTERM / SIGKILL</Text>
+      <Text>l        stop every leftover (ended launcher, orphaned, not installed) after confirmation</Text>
       <Text>g / s    graveyard / settings</Text>
       <Text>/ / r    filter / refresh</Text>
       <Text>? / q    close help / quit</Text>
@@ -1208,20 +1292,20 @@ function useTerminalSize(): {columns: number; rows: number} {
 function tableWidths(columns: number, showKind: boolean): number[] {
   const available = Math.max(1, columns - 2);
   if (columns < 32) {
-    return [0, 0, 6, 0, 0, 0, 0, Math.max(1, available - 7)];
+    return [0, 0, 6, 0, 0, 0, 0, 0, Math.max(1, available - 7)];
   }
   if (columns < 50) {
-    return [0, 0, 6, 7, 0, 0, 10, Math.max(1, available - 26)];
+    return [0, 0, 6, 7, 0, 0, 10, 0, Math.max(1, available - 26)];
   }
   if (columns < 65) {
     const kind = showKind ? 6 : 0;
     const process = Math.max(8, available - kind - 3 - 5 - 6 - 14 - (showKind ? 5 : 4));
-    return [kind, 3, 5, 6, 0, 0, 14, process];
+    return [kind, 3, 5, 6, 0, 0, 14, 0, process];
   }
   if (columns < 80) {
     const kind = showKind ? 6 : 0;
     const process = Math.max(10, available - kind - 3 - 5 - 6 - 8 - 14 - (showKind ? 6 : 5));
-    return [kind, 3, 5, 6, 8, 0, 14, process];
+    return [kind, 3, 5, 6, 8, 0, 14, 0, process];
   }
   const usable = Math.max(80, columns - 2);
   const kind = showKind ? 6 : 0;
@@ -1231,10 +1315,11 @@ function tableWidths(columns: number, showKind: boolean): number[] {
   const age = 8;
   const host = Math.max(10, Math.floor(usable * 0.14));
   const project = Math.max(16, Math.floor(usable * 0.18));
-  const fixed = kind + pin + port + pid + age + host + project;
-  const spaces = showKind ? 8 : 7;
+  const by = columns < 110 ? 0 : 16;
+  const fixed = kind + pin + port + pid + age + host + project + by;
+  const spaces = (showKind ? 8 : 7) + (by ? 1 : 0);
   const process = Math.max(24, usable - fixed - spaces);
-  return [kind, pin, port, pid, age, host, project, process];
+  return [kind, pin, port, pid, age, host, project, by, process];
 }
 
 function nextAvailablePort(listeners: readonly ListenerEntry[], currentPort: number): number | '-' {

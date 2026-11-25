@@ -75,8 +75,9 @@ describe('legacy main-screen UI contract', () => {
     expect.soft(selectedRowIndex).toBeGreaterThan(tableHeaderIndex);
     expect.soft(detailsIndex).toBeGreaterThan(selectedRowIndex);
     expect.soft(lines[detailsIndex + 1]).toMatch(/^-+$/);
-    expect.soft(lines.slice(detailsIndex + 2, detailsIndex + 7)).toEqual([
+    expect.soft(lines.slice(detailsIndex + 2, detailsIndex + 8)).toEqual([
       'port 3001  pid 101  kind DEV  age 00:01:00  pin NO',
+      'by unknown launcher · parent 0',
       'stop scope PID 101, ports 3001  next 3004  dup none',
       'proj alpha',
       'dir  /tmp/project',
@@ -185,10 +186,10 @@ describe('legacy main-screen UI contract', () => {
       '> SYSTEM -   4100  404    01:23:45 localhost   responsive-proj… node /Applicati…',
     );
     expect.soft(selectedRows.get(120)).toBe(
-      '> SYSTEM -   4100  404    01:23:45 localhost        responsive-project-n… node /Applications/Responsive Demo/bin/serve…',
+      '> SYSTEM -   4100  404    01:23:45 localhost        responsive-project-n… -                node /Applications/Responsi…',
     );
     expect.soft(selectedRows.get(140)).toBe(
-      '> SYSTEM -   4100  404    01:23:45 localhost           responsive-project-name… node /Applications/Responsive Demo/bin/server.js --inspect…',
+      '> SYSTEM -   4100  404    01:23:45 localhost           responsive-project-name… -                node /Applications/Responsive Demo/bin/se…',
     );
   });
 

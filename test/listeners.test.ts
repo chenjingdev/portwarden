@@ -418,6 +418,12 @@ describe('host collapsing, keys, selection, and sorting', () => {
     })).toEqual([merged]);
   });
 
+  it('never hides a leftover in the main view', () => {
+    const leftover = entry({pid: 7, port: 9100, kind: 'system', leftover: true});
+    const ordinary = entry({pid: 8, port: 9101, kind: 'system'});
+    expect(selectListeners([ordinary, leftover], {all: false})).toEqual([leftover]);
+  });
+
   it('shows service-like app listeners by default without exposing ordinary app helpers', () => {
     const dev = entry({pid: 1, port: 3000});
     const ollamaService = entry({

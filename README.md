@@ -60,6 +60,7 @@ portwarden --all --watch 2
 | `o` | 브라우저로 열기 |
 | `m` | 검증된 다음 빈 포트로 이동 |
 | `x` / `f` | `SIGTERM` / `SIGKILL`로 종료 |
+| `l` | 남은 것(leftover) 전부를 확인 창에서 한 번에 `SIGTERM` 종료 |
 | `g` | 무덤(Graveyard) 열기 |
 | `s` | 브라우저·확인 모드·갱신 주기 설정 |
 | `/` | 필터 |
@@ -100,6 +101,12 @@ PortWarden은 PID만 믿고 프로세스를 종료하지 않습니다.
 - 로그: `~/.portwarden/logs/<project>-<port>.log`
 
 재실행한 서버가 예상 포트와 명령으로 실제 LISTEN 상태가 되어야 무덤 기록이 제거됩니다.
+
+## 누가 띄웠나와 남은 것
+
+모든 행의 `BY` 열은 그 프로세스를 띄운 Claude Code 세션과 hc 터미널(`<터미널 주소 또는 세션 ID 앞 8자> <이름>`)을 보여 줍니다. 띄운 쪽이 이미 끝났으면 주소 뒤에 `✗`가 붙습니다. 환경 변수 `CLAUDE_CODE_SESSION_ID`·`HC_TERMINAL_ID`를 먼저 보고, 없으면 `/private/tmp/claude-<uid>/<slug>/<uuid>/` 경로에서 세션을 찾습니다. 세션이 살아 있는지는 `~/.claude/sessions`와 프로세스 목록으로, 터미널은 `hc ls --all --json`으로 판정합니다.
+
+**남은 것(leftover)** 은 띄운 쪽이 끝났고, 종료 범위의 루트가 고아(ppid 1)이며, 설치된 공용 프로그램(`~/.claude/plugins`, `/Applications`, `~/Applications`, `~/Library`(캐시 제외), `/System`, `/Library`)이 아닌 행입니다. 노란색으로 표시되며 MAIN 화면에서도 숨기지 않고 헤더에 `[N leftovers · RAM RSS]`로 집계합니다. `l`을 누르면 목록(프로젝트:포트 또는 브라우저 PID, BY, RAM)을 보여 주고 `y`로 승인하면 `x`와 같은 경로로 정확한 범위만 종료합니다. `--json`의 리스너·브라우저 항목에는 `launcher`와 `leftover`가 있습니다.
 
 ## 개발용 브라우저와 메모리
 

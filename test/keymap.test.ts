@@ -10,6 +10,7 @@ describe('normalizeShortcut', () => {
     ['ㅃ', 'q'],
     ['ㅒ', 'o'],
     ['ㅖ', 'p'],
+    ['ㅣ', 'l'],
   ])('normalizes %s to %s', (input, expected) => {
     expect(normalizeShortcut(input)).toBe(expected);
   });

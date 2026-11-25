@@ -1,5 +1,6 @@
 import {listenerKeys, selectionKey} from '../core/listeners.js';
 import {redactCommandLine, sanitizeText} from '../core/commands.js';
+import {launcherLabel} from '../core/launchers.js';
 import type {BrowserSession, ListenerEntry, ZombieCandidate} from '../core/types.js';
 
 export type VisibleRow =
@@ -104,7 +105,7 @@ export function buildVisibleRows(
     .filter((zombie) => !taskPids.has(zombie.pid) && !browserPids.has(zombie.pid) && (!query || zombieSearchText(zombie).includes(query)))
     .map<VisibleRow>((zombie) => ({type: 'zombie', key: `zombie:${zombie.pid}`, zombie, depth: 0}));
   const browserRows = browsers.filter((browser) => !query || sanitizeText([
-    browser.pid, browser.family, browser.name, browser.profile, browser.parentName, browser.parentState,
+    browser.pid, browser.family, browser.name, launcherLabel(browser.launcher), browser.profile, browser.parentName, browser.parentState,
     redactCommandLine(browser.command), ...browser.members.map(({pid}) => pid),
     ...(options.allListeners ?? listeners).filter(({pid}) => browser.members.some((member) => member.pid === pid)).map(({port}) => port),
   ].join(' ')).toLowerCase().includes(query)).map<VisibleRow>((browser) => ({
@@ -144,6 +145,7 @@ function listenerSearchText(entry: ListenerEntry): string {
     entry.displayHost,
     entry.displayProject,
     entry.displayCwd,
+    launcherLabel(entry.launcher),
     redactCommandLine(entry.args),
   ].join(' ')).toLowerCase();
 }

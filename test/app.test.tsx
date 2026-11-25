@@ -772,6 +772,100 @@ describe('PortwardenApp', () => {
     await update();
     expect(app.lastFrame()).toContain('info  Moved.');
   });
+
+  describe('leftovers', () => {
+    const ended = {sessionId: '00000000-0000-4000-8000-000000000000', terminal: 't1yw', name: 'old-tab', state: 'ended' as const};
+    const live = {sessionId: '11111111-1111-4111-8111-111111111111', terminal: 't1z6', name: 'live-tab', state: 'live' as const};
+    const uid = process.getuid!();
+
+    function leftoverFixture() {
+      const root = {pid: 99, ppid: 1, uid, executable: '/usr/bin/node', command: 'npm run dev', name: 'npm', cwd: '/tmp/project', startTime: new Date('2026-01-01')};
+      const task: ProcessTask = {
+        key: 'task:99', root, members: [root, {...root, pid: 98, ppid: 99, command: 'node vite'}], ports: [3001], label: 'alpha', memoryBytes: 300 * 1024 ** 2,
+      };
+      const taskListener = listener({pid: 98, ppid: 99, port: 3001, displayProject: 'alpha', task, launcher: ended, leftover: true});
+      const lonely = listener({pid: 102, ppid: 1, port: 3002, displayProject: 'bravo', launcher: ended, leftover: true, rssBytes: 100 * 1024 ** 2});
+      const liveOne = listener({pid: 103, ppid: 1, port: 3003, displayProject: 'charlie', launcher: live, leftover: false});
+      const daemon = listener({pid: 104, ppid: 1, port: 4179, displayProject: 'khala', launcher: ended, leftover: false});
+      const browsers = detectBrowserSessions([{pid: 555, ppid: 1, uid, name: 'Google Chrome',
+        executable: '/Applications/Google Chrome', command: '/Applications/Google Chrome --remote-debugging-pipe --user-data-dir=/tmp/playwright_chromiumdev_profile-test',
+        startTime: new Date('2026-01-01'), rssBytes: 256 * 1024 ** 2}]).map((browser) => ({...browser, launcher: ended, leftover: true}));
+      scanner.listeners = [taskListener, lonely, liveOne, daemon];
+      scanner.allListeners = scanner.listeners;
+      scanner.browsers = browsers;
+      return {taskListener, lonely, browsers};
+    }
+
+    it('shows who launched each row and counts the leftovers in the header and details', async () => {
+      leftoverFixture();
+      const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{} as unknown as PortwardenActions} />);
+      await update();
+      Object.defineProperty(app.stdout, 'columns', {configurable: true, value: 160});
+      app.stdout.emit('resize');
+      await update();
+      const frame = app.lastFrame() ?? '';
+      expect(frame).toContain('[3 leftovers · 656 MiB RSS]');
+      expect(frame).toMatch(/PROJECT\s+BY\s+PROCESS/);
+      expect(frame).toContain('t1yw✗ old-tab');
+      expect(frame).toContain('t1z6 live-tab');
+      expect(frame).toContain('by t1yw old-tab (ended) session 00000000 · orphan');
+    });
+
+    it('stops every leftover scope, and only those, through the normal stop paths after a confirmation', async () => {
+      const {taskListener, lonely, browsers} = leftoverFixture();
+      const actions = {
+        stopListener: vi.fn(async () => ({message: 'Stopped.'})),
+        stopBrowser: vi.fn(async () => ({message: 'Stopped browser.'})),
+      };
+      const repo = repository(); repo.update({confirmActions: true});
+      const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions as unknown as PortwardenActions} />);
+      await update();
+      app.stdin.write('l');
+      await update();
+      const frame = app.lastFrame() ?? '';
+      expect(frame).toContain('alpha:3001 t1yw✗ old-tab 300 MiB');
+      expect(frame).toContain('bravo:3002 t1yw✗ old-tab 100 MiB');
+      expect(frame).toContain('browser 555 t1yw✗ old-tab 256 MiB');
+      expect(frame).not.toContain('charlie:3003');
+      expect(frame).not.toContain('khala:4179');
+      expect(frame).toContain('Stop 3 leftovers (656 MiB RSS)?');
+      expect(actions.stopListener).not.toHaveBeenCalled();
+      app.stdin.write('y');
+      await update();
+      expect(actions.stopListener.mock.calls as unknown[][]).toEqual([[taskListener, 'SIGTERM'], [lonely, 'SIGTERM']]);
+      expect(actions.stopBrowser.mock.calls as unknown[][]).toEqual([[browsers[0], 'SIGTERM']]);
+    });
+
+    it('accepts the Korean 두벌식 key, cancels with n, and skips pinned scopes', async () => {
+      const {lonely} = leftoverFixture();
+      const actions = {stopListener: vi.fn(async () => ({message: 'Stopped.'})), stopBrowser: vi.fn(async () => ({message: 'Stopped browser.'}))};
+      const repo = repository(); repo.update({confirmActions: true, pinnedListenerKeys: [listenerKey(lonely)]});
+      const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions as unknown as PortwardenActions} />);
+      await update();
+      app.stdin.write('ㅣ');
+      await update();
+      expect(app.lastFrame()).toContain('Stop 2 leftovers');
+      expect(app.lastFrame()).toContain('1 pinned or already stopping skipped');
+      app.stdin.write('n');
+      await update();
+      expect(actions.stopListener).not.toHaveBeenCalled();
+      app.stdin.write('l');
+      await update();
+      app.stdin.write('y');
+      await update();
+      expect(actions.stopListener).toHaveBeenCalledTimes(1);
+      expect((actions.stopListener.mock.calls as unknown[][])[0]?.[0]).toMatchObject({pid: 98});
+      expect(actions.stopBrowser).toHaveBeenCalledTimes(1);
+    });
+
+    it('says so when nothing is left over', async () => {
+      const app = render(<PortwardenApp configRepository={repository()} actionsOverride={{} as unknown as PortwardenActions} />);
+      await update();
+      app.stdin.write('l');
+      await update();
+      expect(app.lastFrame()).toContain('No leftovers.');
+    });
+  });
 });
 
 function repository(): ConfigRepository {

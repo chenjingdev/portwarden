@@ -518,6 +518,7 @@ export function enrichListener(
     displayCommand: summarizeCommand(command, args, home),
     displayCwd: formatDisplayCwd(cwd, args, home),
     ...(startTime ? {startTime} : {}),
+    ...(processInfo?.rssBytes === undefined ? {} : {rssBytes: processInfo.rssBytes}),
   };
 }
 
@@ -785,7 +786,7 @@ export function selectListeners(
 
 /** Keep legacy-relevant local services visible without treating app bundles as dev process groups. */
 export function isDefaultVisibleListener(entry: ListenerEntry): boolean {
-  return entry.kind === 'dev' || (entry.kind === 'app' && hasDevEvidence(entry));
+  return entry.kind === 'dev' || entry.leftover === true || (entry.kind === 'app' && hasDevEvidence(entry));
 }
 
 export function compareListeners(left: ListenerEntry, right: ListenerEntry): number {

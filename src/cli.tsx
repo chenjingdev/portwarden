@@ -68,7 +68,7 @@ Examples:
 
 TUI keys:
   ↑↓ select · ←→ reorder · a all · z zombies · p pin · o open
-  m move · x stop · f force-stop · g graveyard · s settings · / filter · ? help
+  m move · x stop · f force-stop · l leftovers · g graveyard · s settings · / filter · ? help
 `);
 
 async function main(): Promise<void> {
