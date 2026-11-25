@@ -41,6 +41,10 @@ describe('renderOutput', () => {
     const wide = renderOutput([entry], 1, [], {all: true, json: false, terminalWidth: 160});
     expect(wide).toMatch(/PROJECT\s+BY\s+PROCESS/);
     expect(wide).toContain('t1yw✗ old-tab');
+    for (const terminalWidth of [106, 120, 146]) {
+      const table = renderOutput([entry], 1, [], {all: true, json: false, terminalWidth}).split('\n').slice(3);
+      expect(Math.max(...table.map((line) => [...line].length)), `${terminalWidth} columns`).toBeLessThanOrEqual(terminalWidth);
+    }
   });
 });
 

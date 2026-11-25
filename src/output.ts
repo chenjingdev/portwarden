@@ -5,6 +5,7 @@ import type {Launcher} from './core/launchers.js';
 import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
 import {formatMemory} from './core/browserSessions.js';
 import {launcherLabel} from './core/launchers.js';
+import {padDisplayText} from './displayText.js';
 
 export interface OutputOptions {
   all: boolean;
@@ -74,7 +75,7 @@ export function renderOutput(
   const projectWidth = Math.max(10, Math.min(18, Math.floor(width * 0.25)));
   const commandWidth = compact
     ? Math.max(1, width - (ultraCompact ? 8 : 18 + projectWidth))
-    : Math.max(8, Math.min(52, width - 60 - projectWidth - byWidth));
+    : Math.max(8, Math.min(52, width - 61 - projectWidth - byWidth));
   const head = ultraCompact
     ? ['PORT', 'PROCESS']
     : compact
@@ -137,7 +138,7 @@ export function renderOutput(
     lines.push('', `Dev browsers: ${browsers.length} · ${formatMemory(memory)} RSS sum (includes helpers)`,
       '  PID      RAM        PROCS  AGE          FAMILY      BY                PARENT');
     for (const browser of browsers) {
-      lines.push(`  ${String(browser.pid).padEnd(8)} ${formatMemory(browser.memoryBytes).padEnd(10)} ${String(browser.members.length).padEnd(6)} ${formatAge(browser.ageSeconds).padEnd(12)} ${browser.family.padEnd(11)} ${sanitizeText(launcherLabel(browser.launcher)).padEnd(17)} ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState})`);
+      lines.push(`  ${String(browser.pid).padEnd(8)} ${formatMemory(browser.memoryBytes).padEnd(10)} ${String(browser.members.length).padEnd(6)} ${formatAge(browser.ageSeconds).padEnd(12)} ${browser.family.padEnd(11)} ${padDisplayText(sanitizeText(launcherLabel(browser.launcher)), 17)} ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState})`);
     }
     lines.push('RSS can count shared memory more than once. A running parent does not establish activity.',
       'Stop one browser + helpers: portwarden --kill-pid <PID> (add --force for SIGKILL)');

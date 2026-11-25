@@ -817,8 +817,7 @@ describe('PortwardenApp', () => {
         stopListener: vi.fn(async () => ({message: 'Stopped.'})),
         stopBrowser: vi.fn(async () => ({message: 'Stopped browser.'})),
       };
-      const repo = repository(); repo.update({confirmActions: true});
-      const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions as unknown as PortwardenActions} />);
+      const app = render(<PortwardenApp configRepository={repository()} actionsOverride={actions as unknown as PortwardenActions} />);
       await update();
       app.stdin.write('l');
       await update();
@@ -834,6 +833,24 @@ describe('PortwardenApp', () => {
       await update();
       expect(actions.stopListener.mock.calls as unknown[][]).toEqual([[taskListener, 'SIGTERM'], [lonely, 'SIGTERM']]);
       expect(actions.stopBrowser.mock.calls as unknown[][]).toEqual([[browsers[0], 'SIGTERM']]);
+    });
+
+    it('skips a scope that stopped being a leftover between l and y', async () => {
+      const {taskListener, lonely} = leftoverFixture();
+      const actions = {stopListener: vi.fn(async () => ({message: 'Stopped.'})), stopBrowser: vi.fn(async () => ({message: 'Stopped browser.'}))};
+      const repo = repository();
+      const app = render(<PortwardenApp configRepository={repo} actionsOverride={actions as unknown as PortwardenActions} />);
+      await update();
+      app.stdin.write('l');
+      await update();
+      expect(app.lastFrame()).toContain('Stop 3 leftovers');
+      scanner.allListeners = scanner.allListeners.map((entry) => entry === lonely ? {...lonely, launcher: live, leftover: false} : entry);
+      scanner.listeners = scanner.allListeners;
+      app.rerender(<PortwardenApp configRepository={repo} actionsOverride={actions as unknown as PortwardenActions} />);
+      await update();
+      app.stdin.write('y');
+      await update();
+      expect(actions.stopListener.mock.calls as unknown[][]).toEqual([[taskListener, 'SIGTERM']]);
     });
 
     it('accepts the Korean 두벌식 key, cancels with n, and skips pinned scopes', async () => {

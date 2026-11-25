@@ -17,6 +17,7 @@ import type {ListenerEntry} from '../core/types.js';
 import {formatMemory} from '../core/browserSessions.js';
 import {launcherLabel, type Launcher} from '../core/launchers.js';
 import {normalizeShortcut} from './keymap.js';
+import {padDisplayText, truncateDisplayText} from '../displayText.js';
 import {collectLeftovers, leftoverLine, type LeftoverScope} from './leftovers.js';
 import {buildVisibleRows, listenerIsPinned, type VisibleRow} from './rows.js';
 import {useScanner} from './useScanner.js';
@@ -127,6 +128,8 @@ export function PortwardenApp({
     () => collectLeftovers(scanner.allListeners, scanner.browsers ?? []),
     [scanner.allListeners, scanner.browsers],
   );
+  const currentLeftoverKeys = useRef(new Set<string>());
+  currentLeftoverKeys.current = new Set(leftovers.map(({key}) => key));
   const selectedIndex = selectedKey ? visibleRows.findIndex(({key}) => key === selectedKey) : -1;
   const effectiveSelectedIndex = visibleRows.length === 0
     ? -1
@@ -234,11 +237,11 @@ export function PortwardenApp({
     }
   };
 
-  const queueAction = (title: string, detail: string, action: () => Promise<unknown>, lines?: string[]) => {
+  const queueAction = (title: string, detail: string, action: () => Promise<unknown>, lines?: string[], alwaysConfirm = false) => {
     if (actionInFlight.current) return;
     setActionError('');
     setActionWarning('');
-    if (config.confirmActions) {
+    if (alwaysConfirm || config.confirmActions) {
       setConfirmation({title, detail, action, lines});
     } else {
       void action();
@@ -456,7 +459,7 @@ export function PortwardenApp({
     const memory = stoppable.every(({memoryBytes}) => memoryBytes !== null)
       ? stoppable.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null;
     const skipped = leftovers.length - stoppable.length;
-    const listed = stoppable.slice(0, MAX_LEFTOVER_LINES).map(leftoverLine);
+    const listed = stoppable.slice(0, Math.min(MAX_LEFTOVER_LINES, Math.max(1, terminalRows - 22))).map(leftoverLine);
     if (stoppable.length > listed.length) listed.push(`… and ${stoppable.length - listed.length} more`);
     if (skipped > 0) listed.push(`${skipped} pinned or already stopping skipped`);
     queueAction(
@@ -466,13 +469,14 @@ export function PortwardenApp({
         pendingSelectionKey.current = null;
         for (const scope of stoppable) {
           const identities = identitiesOf(scope);
-          if (isStopQueued(identities)) continue;
+          if (!currentLeftoverKeys.current.has(scope.key) || isStopQueued(identities)) continue;
           enqueueStop(identities, scope.label, async () => scope.listener
             ? await actions.stopListener(scope.listener, 'SIGTERM')
             : await actions.stopBrowser(scope.browser!, 'SIGTERM'));
         }
       },
       listed,
+      true,
     );
   };
 
@@ -1338,49 +1342,6 @@ function truncateRawText(value: string, width: number): string {
   return truncateDisplayText(value, width);
 }
 
-function padDisplayText(value: string, width: number): string {
-  const text = truncateDisplayText(value, width);
-  return text + ' '.repeat(Math.max(0, width - displayWidth(text)));
-}
-
-function truncateDisplayText(value: string, width: number): string {
-  if (width <= 0) return '';
-  if (displayWidth(value) <= width) return value;
-  if (width === 1) return '…';
-  const target = width - 1;
-  let result = '';
-  let used = 0;
-  for (const character of value) {
-    const characterWidth = displayCharacterWidth(character);
-    if (used + characterWidth > target) break;
-    result += character;
-    used += characterWidth;
-  }
-  return `${result}…`;
-}
-
-function displayWidth(value: string): number {
-  let width = 0;
-  for (const character of value) width += displayCharacterWidth(character);
-  return width;
-}
-
-function displayCharacterWidth(character: string): number {
-  const codePoint = character.codePointAt(0) ?? 0;
-  return codePoint >= 0x1100 && (
-    codePoint <= 0x115f || codePoint === 0x2329 || codePoint === 0x232a ||
-    (codePoint >= 0x2e80 && codePoint <= 0xa4cf && codePoint !== 0x303f) ||
-    (codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
-    (codePoint >= 0xf900 && codePoint <= 0xfaff) ||
-    (codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
-    (codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
-    (codePoint >= 0xff00 && codePoint <= 0xff60) ||
-    (codePoint >= 0xffe0 && codePoint <= 0xffe6) ||
-    (codePoint >= 0x1f300 && codePoint <= 0x1f64f) ||
-    (codePoint >= 0x1f900 && codePoint <= 0x1f9ff) ||
-    (codePoint >= 0x20000 && codePoint <= 0x3fffd)
-  ) ? 2 : 1;
-}
 
 function formatClock(date: Date): string {
   return [date.getHours(), date.getMinutes(), date.getSeconds()]
