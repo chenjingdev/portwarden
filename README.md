@@ -106,7 +106,7 @@ PortWarden은 PID만 믿고 프로세스를 종료하지 않습니다.
 
 모든 행의 `BY` 열은 그 프로세스를 띄운 Claude Code 세션과 hc 터미널(`<터미널 주소 또는 세션 ID 앞 8자> <이름>`)을 보여 줍니다. 띄운 쪽이 이미 끝났으면 주소 뒤에 `✗`가 붙습니다. 환경 변수 `CLAUDE_CODE_SESSION_ID`·`HC_TERMINAL_ID`를 먼저 보고, 없으면 `/private/tmp/claude-<uid>/<slug>/<uuid>/` 경로에서 세션을 찾습니다. 세션이 살아 있는지는 `~/.claude/sessions`와 프로세스 목록으로, 터미널은 `hc ls --all --json`으로 판정합니다.
 
-**남은 것(leftover)** 은 띄운 쪽이 끝났고, 종료 범위의 루트가 고아(ppid 1)이며, 설치된 공용 프로그램(`~/.claude/plugins`, `/Applications`, `~/Applications`, `~/Library`(캐시 제외), `/System`, `/Library`)이 아닌 행입니다. 노란색으로 표시되며 MAIN 화면에서도 숨기지 않고 헤더에 `[N leftovers · RAM RSS]`로 집계합니다. `l`을 누르면 목록(프로젝트:포트 또는 브라우저 PID, BY, RAM)을 보여 주고 `y`로 승인하면 `x`와 같은 경로로 정확한 범위만 종료합니다. `--json`의 리스너·브라우저 항목에는 `launcher`와 `leftover`가 있습니다.
+**남은 것(leftover)** 은 띄운 Claude 세션(또는 hc 터미널)이 끝났고, 설치된 공용 프로그램(`~/.claude/plugins`, `/Applications`, `~/Applications`, `~/Library`(캐시 제외), `/System`, `/Library`)이 아닌 행입니다. 노란색으로 표시되며 MAIN 화면에서도 숨기지 않고 헤더에 `[N leftovers · RAM RSS]`로 집계합니다. `l`을 누르면 목록(프로젝트:포트 또는 브라우저 PID, BY, RAM)을 보여 주고 `y`로 승인하면 `x`와 같은 경로로 정확한 범위만 종료합니다. `--json`의 리스너·브라우저 항목에는 `launcher`와 `leftover`가 있습니다.
 
 ## 개발용 브라우저와 메모리
 
