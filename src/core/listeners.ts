@@ -113,8 +113,8 @@ const INSTALLED_PROJECT_PATTERNS: readonly RegExp[] = [
 ];
 
 const INTERPRETER_SHORT_NAMES: readonly {pattern: RegExp; name?: string}[] = [
-  {pattern: /\/Python\.app\/Contents\/MacOS\/Python$/, name: 'python3'},
-  {pattern: /\/(node|nodejs|bun|deno|ruby|php|python\d*(?:\.\d+)*)$/},
+  {pattern: /(?:^|\/)Python\.app\/Contents\/MacOS\/Python$/, name: 'python3'},
+  {pattern: /(?:^|\/)(node|nodejs|bun|deno|ruby|php|python\d*(?:\.\d+)*)$/},
 ];
 
 const CLAUDE_TEMP_CWD = /^\/(?:private\/)?tmp\/claude-\d+\/([^/]+)(?:\/|$)/;
@@ -852,15 +852,20 @@ function parsePnpmDlxCommand(input: string): {packageName: string; trailingArgs:
   return packageName ? {packageName, trailingArgs: tokens.slice(index + 1).join(' ')} : null;
 }
 
+/** The short name of an interpreter executable such as node or python3, or undefined for any other program. */
+export function interpreterShortName(executable: string): string | undefined {
+  for (const {pattern, name} of INTERPRETER_SHORT_NAMES) {
+    const match = pattern.exec(executable);
+    if (match) return name ?? match[1];
+  }
+  return undefined;
+}
+
 function shortenInterpreter(commandLine: string): string {
   const split = commandLine.indexOf(' ');
   const executable = split < 0 ? commandLine : commandLine.slice(0, split);
-  if (!path.isAbsolute(executable)) return commandLine;
-  for (const {pattern, name} of INTERPRETER_SHORT_NAMES) {
-    const match = pattern.exec(executable);
-    if (match) return `${name ?? match[1]}${commandLine.slice(executable.length)}`;
-  }
-  return commandLine;
+  const name = path.isAbsolute(executable) ? interpreterShortName(executable) : undefined;
+  return name ? `${name}${commandLine.slice(executable.length)}` : commandLine;
 }
 
 function summarizeCommand(command: string, args: string, home: string): string {

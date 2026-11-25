@@ -10,6 +10,7 @@ import {ConfigRepository} from './config.js';
 import {formatActionOutcomes, stopListenerMatches} from './cliActions.js';
 import {PortwardenActions, type ActionOutcome, type StopSignal} from './core/actions.js';
 import {collectListeners, selectListeners} from './core/listeners.js';
+import {scanSystem} from './core/scan.js';
 import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
 import {detectBrowserSessions} from './core/browserSessions.js';
 import {collectProcesses, detectZombieCandidates, reapZombie} from './core/zombies.js';
@@ -118,14 +119,11 @@ async function scan(
   configRepository: ConfigRepository,
   options: Pick<CliOptions, 'all' | 'json' | 'zombies'>,
 ): Promise<{allListeners: ListenerEntry[]; listeners: ListenerEntry[]; zombies: ZombieCandidate[]; browsers: BrowserSession[]}> {
-  const processPromise = collectProcesses();
-  const listenerPromise = collectListeners({strict: true, processProvider: () => processPromise});
-  const [processes, allListeners] = await Promise.all([processPromise, listenerPromise]);
+  const {processes, allListeners, browsers} = await scanSystem();
   const config = configRepository.get();
-  const taskPids = new Set(allListeners.flatMap(({task}) => task?.members.map(({pid}) => pid) ?? []));
   return {
     allListeners,
-    browsers: detectBrowserSessions(processes).filter(({pid}) => !taskPids.has(pid)),
+    browsers,
     listeners: selectListeners(allListeners, {
       all: options.all,
       pinnedListenerKeys: config.pinnedListenerKeys,

@@ -1,3 +1,5 @@
+import type {Launcher} from './launchers.js';
+
 export type ListenerKind = 'dev' | 'app' | 'system';
 
 /** A process snapshot. `command` is kept verbatim for safe PID revalidation. */
@@ -26,6 +28,8 @@ export interface BrowserSession extends ProcessInfo {
   /** Sum of member RSS, not a prediction of memory freed on exit. */
   memoryBytes: number | null;
   reason: string;
+  launcher?: Launcher;
+  leftover?: boolean;
 }
 
 export interface RawListener {
@@ -75,6 +79,10 @@ export interface ListenerEntry {
   displayCommand: string;
   displayCwd: string;
   startTime?: Date;
+  /** Who started the stop scope root: the task root for a task, otherwise this PID. */
+  launcher?: Launcher;
+  /** The launcher has ended, the scope root is orphaned, and the program is not installed for shared use. */
+  leftover?: boolean;
 }
 
 export interface ListenerSelectionOptions {

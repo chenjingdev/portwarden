@@ -1,8 +1,10 @@
 import Table from 'cli-table3';
 
 import {redactCommandLine, sanitizeText} from './core/commands.js';
+import type {Launcher} from './core/launchers.js';
 import type {BrowserSession, ListenerEntry, ZombieCandidate} from './core/types.js';
 import {formatMemory} from './core/browserSessions.js';
+import {launcherLabel} from './core/launchers.js';
 
 export interface OutputOptions {
   all: boolean;
@@ -66,22 +68,23 @@ export function renderOutput(
   }
 
   const width = options.terminalWidth ?? process.stdout.columns ?? 120;
+  const byWidth = 16;
   const ultraCompact = width < 32;
-  const compact = width < 90;
+  const compact = width < 90 + byWidth;
   const projectWidth = Math.max(10, Math.min(18, Math.floor(width * 0.25)));
   const commandWidth = compact
     ? Math.max(1, width - (ultraCompact ? 8 : 18 + projectWidth))
-    : Math.max(8, Math.min(52, width - 60 - projectWidth));
+    : Math.max(8, Math.min(52, width - 60 - projectWidth - byWidth));
   const head = ultraCompact
     ? ['PORT', 'PROCESS']
     : compact
       ? ['PORT', 'PID', 'PROJECT', 'PROCESS']
-      : ['KIND', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'PROCESS'];
+      : ['KIND', 'PORT', 'PID', 'AGE', 'HOST', 'PROJECT', 'BY', 'PROCESS'];
   const colWidths = ultraCompact
     ? [7, commandWidth]
     : compact
       ? [7, 8, projectWidth, commandWidth]
-      : [9, 7, 8, 13, 17, projectWidth, commandWidth];
+      : [9, 7, 8, 13, 17, projectWidth, byWidth, commandWidth];
   const table = new Table({
     head,
     colWidths,
@@ -89,7 +92,7 @@ export function renderOutput(
       ? ['right', 'left']
       : compact
         ? ['right', 'right', 'left', 'left']
-        : ['left', 'right', 'right', 'left', 'left', 'left', 'left'],
+        : ['left', 'right', 'right', 'left', 'left', 'left', 'left', 'left'],
     wordWrap: false,
     style: {'padding-left': 0, 'padding-right': 1, head: [], border: []},
     chars: {
@@ -109,9 +112,10 @@ export function renderOutput(
       entry.elapsed,
       entry.displayHost,
       sanitizeText(entry.displayProject) || '-',
+      sanitizeText(launcherLabel(entry.launcher)),
       `${entry.task ? `${entry.task.members.length} procs · ` : ''}${ports.length > 1 ? `ports ${ports.join(', ')} · ` : ''}${redactCommandLine(entry.task?.root.command || entry.args || entry.displayCommand)}`,
     ];
-    table.push(ultraCompact ? [fullRow[1]!, fullRow[6]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[6]!] : fullRow);
+    table.push(ultraCompact ? [fullRow[1]!, fullRow[7]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[7]!] : fullRow);
   }
   for (const zombie of zombies) {
     const fullRow = [
@@ -121,18 +125,19 @@ export function renderOutput(
       formatAge(zombie.ageSeconds),
       '-',
       zombie.family,
+      '-',
       redactCommandLine(zombie.command),
     ];
-    table.push(ultraCompact ? [fullRow[1]!, fullRow[6]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[6]!] : fullRow);
+    table.push(ultraCompact ? [fullRow[1]!, fullRow[7]!] : compact ? [fullRow[1]!, fullRow[2]!, fullRow[5]!, fullRow[7]!] : fullRow);
   }
   if (listeners.length + zombies.length > 0) lines.push(table.toString());
   if (browsers.length > 0) {
     const memory = browsers.every(({memoryBytes}) => memoryBytes !== null)
       ? browsers.reduce((sum, {memoryBytes}) => sum + (memoryBytes ?? 0), 0) : null;
     lines.push('', `Dev browsers: ${browsers.length} · ${formatMemory(memory)} RSS sum (includes helpers)`,
-      '  PID      RAM        PROCS  AGE          FAMILY      PARENT');
+      '  PID      RAM        PROCS  AGE          FAMILY      BY                PARENT');
     for (const browser of browsers) {
-      lines.push(`  ${String(browser.pid).padEnd(8)} ${formatMemory(browser.memoryBytes).padEnd(10)} ${String(browser.members.length).padEnd(6)} ${formatAge(browser.ageSeconds).padEnd(12)} ${browser.family.padEnd(11)} ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState})`);
+      lines.push(`  ${String(browser.pid).padEnd(8)} ${formatMemory(browser.memoryBytes).padEnd(10)} ${String(browser.members.length).padEnd(6)} ${formatAge(browser.ageSeconds).padEnd(12)} ${browser.family.padEnd(11)} ${sanitizeText(launcherLabel(browser.launcher)).padEnd(17)} ${browser.ppid} ${sanitizeText(browser.parentName)} (${browser.parentState})`);
     }
     lines.push('RSS can count shared memory more than once. A running parent does not establish activity.',
       'Stop one browser + helpers: portwarden --kill-pid <PID> (add --force for SIGKILL)');
@@ -175,6 +180,8 @@ function listenerToJson(entry: ListenerEntry): Record<string, unknown> {
     project: sanitizeText(entry.displayProject),
     command: redactCommandLine(entry.args || entry.displayCommand),
     cwd: sanitizeText(entry.displayCwd),
+    launcher: entry.launcher && launcherToJson(entry.launcher),
+    leftover: Boolean(entry.leftover),
   };
 }
 
@@ -199,7 +206,13 @@ function browserToJson(entry: BrowserSession): Record<string, unknown> {
     parentState: entry.parentState, parentName: sanitizeText(entry.parentName),
     profile: sanitizeText(entry.profile), reason: sanitizeText(entry.reason),
     command: redactCommandLine(entry.command),
+    launcher: entry.launcher && launcherToJson(entry.launcher),
+    leftover: Boolean(entry.leftover),
   };
+}
+
+function launcherToJson(launcher: Launcher): Launcher {
+  return {...launcher, ...(launcher.name ? {name: sanitizeText(launcher.name)} : {})};
 }
 
 function formatAge(seconds: number | null): string {

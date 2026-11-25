@@ -26,6 +26,22 @@ describe('renderOutput', () => {
     expect(output).not.toContain('\n');
     expect(JSON.parse(output)).toHaveLength(1);
   });
+
+  it('adds the launcher and leftover to JSON listeners and a BY column to the wide table', () => {
+    const entry = {
+      ...listener(),
+      launcher: {sessionId: '00000000-0000-4000-8000-000000000000', terminal: 't1yw', name: 'old-tab', state: 'ended' as const},
+      leftover: true,
+    };
+    const [json] = JSON.parse(renderOutput([entry], 1, [], {all: true, json: true})) as Array<Record<string, unknown>>;
+    expect(json).toMatchObject({launcher: entry.launcher, leftover: true});
+    const [plain] = JSON.parse(renderOutput([listener()], 1, [], {all: true, json: true})) as Array<Record<string, unknown>>;
+    expect(plain).toMatchObject({leftover: false});
+    expect(plain).not.toHaveProperty('launcher');
+    const wide = renderOutput([entry], 1, [], {all: true, json: false, terminalWidth: 160});
+    expect(wide).toMatch(/PROJECT\s+BY\s+PROCESS/);
+    expect(wide).toContain('t1yw✗ old-tab');
+  });
 });
 
 function listener(): ListenerEntry {
