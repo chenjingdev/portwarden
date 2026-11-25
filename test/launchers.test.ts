@@ -13,6 +13,7 @@ const ENDED_SESSION = '00000000-0000-4000-8000-000000000000';
 const TEMP_SESSION = '22222222-2222-4222-8222-222222222222';
 const REPLACED_SESSION = '33333333-3333-4333-8333-333333333333';
 const REUSED_SESSION = '44444444-4444-4444-8444-444444444444';
+const STARTED_SESSION = '55555555-5555-4555-8555-555555555555';
 
 let home = '';
 let sessionsDirectory = '';
@@ -25,6 +26,7 @@ beforeAll(() => {
   fs.writeFileSync(path.join(sessionsDirectory, '4242.json'), JSON.stringify({pid: 4242, sessionId: LIVE_SESSION, name: 'live-chat'}));
   fs.writeFileSync(path.join(sessionsDirectory, '9999.json'), JSON.stringify({pid: 9999, sessionId: ENDED_SESSION, name: 'stale-chat'}));
   fs.writeFileSync(path.join(sessionsDirectory, '5151.json'), JSON.stringify({pid: 5151, sessionId: REUSED_SESSION, procStart: 'Mon Jan  1 00:00:00 2001'}));
+  fs.writeFileSync(path.join(sessionsDirectory, '6161.json'), JSON.stringify({pid: 6161, sessionId: STARTED_SESSION, procStart: 'Sun Nov 22 22:49:59 2026'}));
   fs.writeFileSync(path.join(sessionsDirectory, '4242.abc.key'), 'not json');
   fs.writeFileSync(path.join(sessionsDirectory, '7.json'), JSON.stringify({peerToken: 'x'}));
 });
@@ -52,7 +54,7 @@ function options(env: Record<number, string>, extra: Partial<LauncherOptions> = 
   };
 }
 
-const processes = [{pid: 4242}, {pid: 1}, {pid: 5151, startTime: new Date('2026-11-26T00:00:00Z')}] as ProcessInfo[];
+const processes = [{pid: 4242}, {pid: 1}, {pid: 5151, startTime: new Date('2026-11-26T00:00:00Z')}, {pid: 6161, startTime: new Date('2026-11-22T22:49:59Z')}] as ProcessInfo[];
 
 describe('launcher resolution', () => {
   it('reads the Claude session and hc terminal from the process environment and names it after the terminal', async () => {
@@ -81,6 +83,8 @@ describe('launcher resolution', () => {
       522: `x CLAUDE_CODE_SESSION_ID=${REUSED_SESSION}`,
     }));
     expect(launchers.get(522)).toMatchObject({state: 'ended'});
+    const started = await collectLaunchers([target({pid: 523})], processes, options({523: `x CLAUDE_CODE_SESSION_ID=${STARTED_SESSION}`}));
+    expect(started.get(523)).toMatchObject({state: 'live'});
   });
 
   it('marks a session ended when no live process owns it and falls back to the terminal location, then the session name', async () => {

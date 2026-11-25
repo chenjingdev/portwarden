@@ -171,7 +171,7 @@ export async function collectLaunchers(
   const terminals = needsTerminals ? parseHcTerminals(await (options.runHc ?? runHc)()) : new Map<string, HcTerminal>();
   const startByPid = new Map(processes.map(({pid, startTime}) => [pid, startTime?.getTime()]));
   const sessionAlive = (session: ClaudeSession): boolean => startByPid.has(session.pid) &&
-    (!session.procStart || new Date(session.procStart).getTime() === startByPid.get(session.pid));
+    (!session.procStart || new Date(`${session.procStart} UTC`).getTime() === startByPid.get(session.pid));
 
   const launchers = new Map<number, Launcher>();
   for (const [pid, {sessionId, terminal, slug}] of identities) {
