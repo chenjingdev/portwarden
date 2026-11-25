@@ -1,7 +1,6 @@
 import path from 'node:path';
 
 import {execa} from 'execa';
-import psList, {type ProcessDescriptor} from 'ps-list';
 
 import type {CommandResult, ListenerEntry, ProcessInfo, ZombieCandidate, ZombieFamily} from './types.js';
 
@@ -42,15 +41,11 @@ export interface DetectZombieOptions {
 }
 
 export interface CollectProcessesOptions {
-  provider?: () => Promise<readonly ProcessDescriptor[]>;
-  resourceProvider?: () => Promise<ReadonlyMap<number, ProcessResources>>;
+  runPs?: (locale: PsLocale, args: readonly string[]) => Promise<string>;
   now?: Date | number;
 }
 
-interface ProcessResources {
-  rssBytes: number;
-  defunct: boolean;
-}
+export type PsLocale = 'C' | 'en_US.UTF-8';
 
 export interface ZombieCommandRunner {
   (file: string, args: readonly string[], signal?: AbortSignal): Promise<CommandResult>;
@@ -88,63 +83,61 @@ export interface WaitForZombieExitOptions {
   pollIntervalMs?: number;
 }
 
-export async function collectProcesses(options: CollectProcessesOptions = {}): Promise<ProcessInfo[]> {
-  const provider = options.provider ?? (() => psList({all: true}));
-  const resourceProvider = options.resourceProvider ??
-    (options.provider ? () => new Map<number, ProcessResources>() : collectProcessResources);
-  const [descriptors, resources] = await Promise.all([
-    provider(),
-    resourceProvider(),
-  ]);
-  const now = toTimestamp(options.now ?? Date.now());
-  return descriptors
-    .flatMap((descriptor) => {
-      const {pid} = descriptor;
-      const resource = resources.get(pid);
-      // The OS has already terminated a state-Z process. Only its table
-      // entry remains until the parent reads its exit status.
-      if (!Number.isSafeInteger(pid) || pid <= 0 || resource?.defunct) return [];
-      return [{...processFromDescriptor(descriptor, now), ...(resource ? {rssBytes: resource.rssBytes} : {})}];
-    })
-    .sort((left, right) => left.pid - right.pid);
+const PS_TABLE_ARGS = ['-axo', 'pid=,ppid=,uid=,rss=,stat=,lstart='] as const;
+const PS_COMM_ARGS = ['-axww', '-o', 'pid=,comm='] as const;
+const PS_COMMAND_ARGS = ['-axww', '-o', 'pid=,command='] as const;
+
+async function runPs(locale: PsLocale, args: readonly string[]): Promise<string> {
+  const result = await execa('ps', args, {env: {LC_ALL: locale}, maxBuffer: 256 * 1024 * 1024});
+  return result.stdout;
 }
 
-export function parseProcessResources(raw: string): Map<number, ProcessResources> {
-  const result = new Map<number, ProcessResources>();
-  for (const line of raw.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
+export async function collectProcesses(options: CollectProcessesOptions = {}): Promise<ProcessInfo[]> {
+  const run = options.runPs ?? runPs;
+  const [table, comms, commands] = await Promise.all([
+    run('C', PS_TABLE_ARGS),
+    run('en_US.UTF-8', PS_COMM_ARGS),
+    run('en_US.UTF-8', PS_COMMAND_ARGS),
+  ]);
+  return parseProcessTables(table, comms, commands, toTimestamp(options.now ?? Date.now()));
+}
+
+const PS_TABLE_LINE = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(-?\d+)\s+(\S+)\s+(.+?)\s*$/;
+
+export function parseProcessTables(table: string, comms: string, commands: string, now = Date.now()): ProcessInfo[] {
+  const commByPid = parsePidColumn(comms);
+  const commandByPid = parsePidColumn(commands);
+  const processes: ProcessInfo[] = [];
+  for (const line of table.split(/\r?\n/)) {
+    const match = PS_TABLE_LINE.exec(line);
     if (!match) continue;
-    const pid = Number(match[1]);
-    const bytes = Number(match[2]) * 1024;
-    if (pid > 0 && Number.isSafeInteger(pid) && Number.isSafeInteger(bytes)) {
-      result.set(pid, {rssBytes: bytes, defunct: match[3]!.startsWith('Z')});
-    }
+    const [, pidText, ppidText, uidText, rssText, stat, lstart] = match;
+    const pid = Number(pidText);
+    if (pid <= 0 || stat!.startsWith('Z')) continue;
+    const comm = commByPid.get(pid) ?? '';
+    const startTime = new Date(lstart!);
+    const rss = Number(rssText);
+    processes.push({
+      pid,
+      ppid: Number(ppidText),
+      uid: Number(uidText),
+      name: path.basename(comm),
+      command: commandByPid.get(pid) ?? '',
+      executable: comm.startsWith('/') ? comm : '',
+      ...(Number.isFinite(startTime.getTime()) ? {startTime, ageMs: Math.max(0, now - startTime.getTime())} : {}),
+      ...(rss >= 0 ? {rssBytes: rss * 1024} : {}),
+    });
+  }
+  return processes.sort((left, right) => left.pid - right.pid);
+}
+
+function parsePidColumn(raw: string): Map<number, string> {
+  const result = new Map<number, string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const match = /^\s*(\d+) (.*)$/.exec(line);
+    if (match) result.set(Number(match[1]), match[2]!);
   }
   return result;
-}
-
-async function collectProcessResources(): Promise<Map<number, ProcessResources>> {
-  try {
-    const result = await execa('ps', ['-axo', 'pid=,rss=,stat='], {reject: false});
-    return result.exitCode === 0 ? parseProcessResources(result.stdout) : new Map();
-  } catch {
-    return new Map();
-  }
-}
-
-export function processFromDescriptor(descriptor: ProcessDescriptor, now = Date.now()): ProcessInfo {
-  const startTime = descriptor.startTime instanceof Date && Number.isFinite(descriptor.startTime.getTime())
-    ? descriptor.startTime
-    : undefined;
-  return {
-    pid: descriptor.pid,
-    ppid: descriptor.ppid,
-    ...(typeof descriptor.uid === 'number' ? {uid: descriptor.uid} : {}),
-    name: descriptor.name ?? '',
-    command: descriptor.cmd ?? '',
-    executable: descriptor.path ?? '',
-    ...(startTime ? {startTime, ageMs: Math.max(0, now - startTime.getTime())} : {}),
-  };
 }
 
 async function defaultCommandRunner(

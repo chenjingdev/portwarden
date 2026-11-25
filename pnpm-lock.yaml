@@ -34,9 +34,6 @@ importers:
       open:
         specifier: ^11.0.1
         version: 11.0.1
-      ps-list:
-        specifier: ^9.0.0
-        version: 9.0.0
       react:
         specifier: ^19.2.8
         version: 19.2.8
@@ -1458,10 +1455,6 @@ packages:
   pretty-ms@9.3.0:
     resolution: {integrity: sha512-gjVS5hOP+M3wMm5nmNOucbIrqudzs9v/57bWRHQWLYklXqoXKrVfYW2W9+glfGsqtPgpiz5WwyEEB+ksXIx3gQ==}
     engines: {node: '>=18'}
-
-  ps-list@9.0.0:
-    resolution: {integrity: sha512-lxMEoIL/BQlk2KunFzxwUPwMvjFH7x7cmvzSLsSHpyMXl9FFfLUlfKrYwFc4wx/ZaIxxuXC4n8rjQ1CX/tkXVQ==}
-    engines: {node: '>=20'}
 
   react-reconciler@0.33.0:
     resolution: {integrity: sha512-KetWRytFv1epdpJc3J4G75I4WrplZE5jOL7Yq0p34+OVOKF4Se7WrdIdVC45XsSSmUTlht2FM/fM1FZb1mfQeA==}
@@ -2896,8 +2889,6 @@ snapshots:
   pretty-ms@9.3.0:
     dependencies:
       parse-ms: 4.0.0
-
-  ps-list@9.0.0: {}
 
   react-reconciler@0.33.0(react@19.2.8):
     dependencies:

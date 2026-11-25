@@ -9,7 +9,7 @@ import {PortwardenActions} from '../src/core/actions.js';
 import {detectBrowserSessions, formatMemory} from '../src/core/browserSessions.js';
 import {listenerKey} from '../src/core/listeners.js';
 import type {ListenerEntry, ProcessInfo} from '../src/core/types.js';
-import {collectProcesses, detectZombieCandidates, parseProcessResources} from '../src/core/zombies.js';
+import {collectProcesses, detectZombieCandidates} from '../src/core/zombies.js';
 import {renderOutput} from '../src/output.js';
 import {buildVisibleRows} from '../src/tui/rows.js';
 
@@ -72,16 +72,16 @@ describe('development browser inventory', () => {
     expect(formatMemory(null)).toBe('? RAM');
   });
   it('reports RSS in bytes and omits defunct processes from the live inventory', async () => {
-    const processes = await collectProcesses({
-      provider: async () => [
-        {pid: 101, ppid: 1, name: 'chrome'},
-        {pid: 102, ppid: 101, name: 'chrome helper'},
-        {pid: 103, ppid: 101, name: 'exited helper'},
-        {pid: 104, ppid: 101, name: 'helper with unknown RSS'},
-      ],
-      resourceProvider: async () => parseProcessResources(' 101 1234 S+\n102 0 S\n103 0 Zs\n104 -4 S'),
-    });
-    expect(processes.map(({pid, rssBytes}) => [pid, rssBytes])).toEqual([[101, 1234 * 1024], [102, 0], [104, undefined]]);
+    const table = [
+      '  101     1   501   1234 S+   Fri Nov 20 10:33:07 2026',
+      '  102   101   501      0 S    Fri Nov 20 10:33:08 2026',
+      '  103   101   501      0 Zs   Fri Nov 20 10:33:08 2026',
+    ].join('\n');
+    const comms = '101 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome\n102 /Applications/Chrome Helper\n103 /x';
+    const commands = '101 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-pipe\n102 /Applications/Chrome Helper --type=renderer\n103 /x';
+    const processes = await collectProcesses({runPs: async (_locale, args) => args.includes('pid=,comm=') ? comms : args.includes('pid=,command=') ? commands : table});
+    expect(processes.map(({pid, rssBytes}) => [pid, rssBytes])).toEqual([[101, 1234 * 1024], [102, 0]]);
+    expect(processes[0]).toMatchObject({ppid: 1, uid: 501, name: 'Google Chrome', executable: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
   });
   it('shows sessions once without a port or zombie opt-in and emits structured memory totals', () => {
     const sessions = detectBrowserSessions([root(), helper()]);

@@ -1,8 +1,11 @@
+import {spawn} from 'node:child_process';
+
 import {describe, expect, it, vi} from 'vitest';
 
 import {
   browserFamily,
   collectListeningPids,
+  collectProcesses,
   collectZombies,
   commandsByteEqual,
   detectZombieCandidates,
@@ -280,5 +283,39 @@ describe('fail-closed collection and reaping', () => {
       kill,
     })).resolves.toBe(false);
     expect(kill).toHaveBeenCalledWith(original.pid, 'SIGTERM');
+  });
+});
+
+describe('collectProcesses', () => {
+  it('keeps non-ASCII executable and argv paths intact and reads fixed-format start times', async () => {
+    const table = '  501     1   501   2048 Ss   Fri Nov 20 10:33:07 2026';
+    const comm = '501 /Applications/통합 로그인.app/Contents/MacOS/통합 로그인';
+    const command = '501 /Applications/통합 로그인.app/Contents/MacOS/통합 로그인 --flag';
+    const calls: Array<[string, readonly string[]]> = [];
+    const [entry] = await collectProcesses({
+      now: new Date('2026-11-20T10:34:07'),
+      runPs: async (locale, args) => {
+        calls.push([locale, args]);
+        return args.includes('pid=,comm=') ? comm : args.includes('pid=,command=') ? command : table;
+      },
+    });
+    expect(entry).toMatchObject({
+      pid: 501, ppid: 1, uid: 501, rssBytes: 2048 * 1024, name: '통합 로그인',
+      executable: '/Applications/통합 로그인.app/Contents/MacOS/통합 로그인',
+      command: '/Applications/통합 로그인.app/Contents/MacOS/통합 로그인 --flag', ageMs: 60_000,
+    });
+    expect(calls.map(([locale]) => locale).sort()).toEqual(['C', 'en_US.UTF-8', 'en_US.UTF-8']);
+  });
+
+  it('lists a real child with its UTF-8 argv and parent through the real ps', async () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', '통합 로그인'], {stdio: 'ignore'});
+    try {
+      const entry = (await collectProcesses()).find(({pid}) => pid === child.pid);
+      expect(entry).toMatchObject({uid: process.getuid!(), ppid: process.pid, executable: process.execPath});
+      expect(entry?.command).toContain('통합 로그인');
+      expect(entry?.startTime).toBeInstanceOf(Date);
+    } finally {
+      child.kill('SIGKILL');
+    }
   });
 });
