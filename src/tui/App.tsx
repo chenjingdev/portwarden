@@ -1266,7 +1266,7 @@ function HelpScreen() {
       <Text>p        pin/unpin a listener or group (pinned listeners cannot be stopped)</Text>
       <Text>o / m    open in browser / safely move to the next verified port</Text>
       <Text>x / f    SIGTERM / SIGKILL</Text>
-      <Text>l        stop every leftover (ended launcher, orphaned, not installed) after confirmation</Text>
+      <Text>l        stop every leftover (its launcher session ended, not an installed program) after confirmation</Text>
       <Text>g / s    graveyard / settings</Text>
       <Text>/ / r    filter / refresh</Text>
       <Text>? / q    close help / quit</Text>
