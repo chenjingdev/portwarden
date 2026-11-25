@@ -1,10 +1,15 @@
-import {describe, expect, it} from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import {afterAll, describe, expect, it} from 'vitest';
 
 import {
   canonicalHost,
   classifyListener,
   collapseEquivalentListeners,
   collectListeners,
+  enrichListener,
   getEntryPreferenceKey,
   getProjectName,
   listenerKey,
@@ -14,6 +19,7 @@ import {
   parseLsofListeners,
   parseLsofProcessMetadata,
   parsePsProcessTable,
+  resolveClaudeSlug,
   selectListeners,
   sortListeners,
 } from '../src/core/listeners.js';
@@ -468,5 +474,63 @@ describe('host collapsing, keys, selection, and sorting', () => {
     ];
 
     expect(sortListeners(restarted, {orderedEntryKeys: savedOrder}).map(({port}) => port)).toEqual([3002, 3001]);
+  });
+});
+
+describe('project names for installed apps, Claude temp folders, and worktrees', () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'portwarden-home-')));
+  fs.mkdirSync(path.join(home, 'dev', 'tool-khala', '.claude', 'worktrees', 'agent-1'), {recursive: true});
+  fs.mkdirSync(path.join(home, 'dev', 'portwarden'), {recursive: true});
+  afterAll(() => fs.rmSync(home, {recursive: true, force: true}));
+  const slug = (target: string) => target.replace(/[^a-zA-Z0-9]/g, '-');
+  const tempCwd = (target: string) => `/private/tmp/claude-501/${slug(target)}/0f292e89-f590-4b1a-9163-e5944279833e/scratchpad`;
+
+  it('names a ~/Library process after its plugin or app bundle instead of Library', () => {
+    expect(getProjectName({
+      cwd: `${home}/Library/Application Support/HonchoAgentBridge`,
+      command: 'node',
+      args: `/opt/homebrew/Cellar/node/26.8.1/bin/node ${home}/.claude/plugins/cache/khala/khala/0.17.66/scripts/ui.mjs`,
+      home,
+    })).toBe('khala');
+    expect(getProjectName({
+      cwd: `${home}/Library/Containers/com.docker.docker/Data`,
+      command: 'com.docker.backend',
+      args: '/Applications/Docker.app/Contents/MacOS/com.docker.backend services --autostart',
+      home,
+    })).toBe('Docker');
+    expect(getProjectName({
+      cwd: `${home}/Library/Application Support/unified-login-check`,
+      command: 'bun',
+      args: '/Users/test/.bun/bin/bun check-service.ts',
+      home,
+    })).toBe('Unified-login-check');
+  });
+
+  it('resolves a Claude temp folder slug against the filesystem and marks it :tmp', () => {
+    expect(resolveClaudeSlug(slug(`${home}/dev/tool-khala`))).toBe(`${home}/dev/tool-khala`);
+    expect(getProjectName({cwd: tempCwd(`${home}/dev/portwarden`), command: 'python3', args: 'python3 -m http.server', home}))
+      .toBe('portwarden:tmp');
+    expect(getProjectName({cwd: tempCwd(`${home}/dev/tool-khala`), command: 'python3', args: '', home})).toBe('tool-khala:tmp');
+  });
+
+  it('names a worktree <repo>@<worktree>, also from a temp folder slug', () => {
+    const worktree = `${home}/dev/tool-khala/.claude/worktrees/agent-1`;
+    expect(getProjectName({cwd: `${worktree}/src`, command: 'node', args: 'node server.js', home})).toBe('tool-khala@agent-1');
+    expect(getProjectName({cwd: tempCwd(worktree), command: 'node', args: '', home})).toBe('tool-khala@agent-1:tmp');
+  });
+});
+
+describe('command display', () => {
+  const display = (args: string) => enrichListener(
+    {pid: 1, command: 'Python', endpoint: '*:8000'}, {host: '*', port: 8000}, {pid: 1, ppid: 1, name: 'Python', command: args, executable: ''},
+    '/Users/test/dev/board', {home: '/Users/test'},
+  ).displayCommand;
+
+  it('shows a short interpreter name instead of its absolute path', () => {
+    expect(display('/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python -I /Users/test/dev/orchestrator/board/bin/board watch'))
+      .toBe('python3 -I ~/dev/orchestrator/board/bin/board watch');
+    expect(display('/opt/homebrew/Cellar/node/26.8.1/bin/node /Users/test/dev/app/server.js')).toBe('node ~/dev/app/server.js');
+    expect(display('/Users/test/.bun/bin/bun run dev')).toBe('bun run dev');
+    expect(display('/Applications/Docker.app/Contents/MacOS/com.docker.backend services')).toBe('/Applications/Docker.app/Contents/MacOS/com.docker.backend services');
   });
 });

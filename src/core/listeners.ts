@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import {homedir} from 'node:os';
 import process from 'node:process';
@@ -105,6 +106,19 @@ const DEV_PORTS = new Set([
   5176, 5500, 5501, 6006, 8000, 8001, 8080, 8081, 8082, 8088, 8787, 9000, 9001,
   9229, 24678,
 ]);
+
+const INSTALLED_PROJECT_PATTERNS: readonly RegExp[] = [
+  /\/plugins\/cache\/[^/]+\/([^/]+)(?:\/|$)/,
+  /\/Applications\/([^/]+)\.app(?:\/|$)/,
+];
+
+const INTERPRETER_SHORT_NAMES: readonly {pattern: RegExp; name?: string}[] = [
+  {pattern: /\/Python\.app\/Contents\/MacOS\/Python$/, name: 'python3'},
+  {pattern: /\/(node|nodejs|bun|deno|ruby|php|python\d*(?:\.\d+)*)$/},
+];
+
+const CLAUDE_TEMP_CWD = /^\/(?:private\/)?tmp\/claude-\d+\/([^/]+)(?:\/|$)/;
+const CLAUDE_WORKTREE_CWD = /^(.*?)\/\.claude\/worktrees\/([^/]+)(?:\/|$)/;
 
 const KIND_ORDER: Record<ListenerKind, number> = {dev: 0, app: 1, system: 2};
 const LSOF_LISTEN_ARGS = ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpcn'] as const;
@@ -477,7 +491,7 @@ export function enrichListener(
   const command = base.command || processInfo?.name || firstToken(args) || '-';
   const executable = processInfo?.executable ?? '';
   const appFamily = inferAppFamily({cwd, command, args, executable});
-  const projectName = getProjectName({cwd, command, args, home});
+  const projectName = getProjectName({cwd, command, args, home, appFamily});
   const startTime = processInfo?.startTime;
   const ageMs = processInfo?.ageMs ?? (
     startTime ? Math.max(0, (options.now ?? new Date()).getTime() - startTime.getTime()) : undefined
@@ -591,8 +605,26 @@ export function getProjectName(details: ListenerDetails): string {
     return inferProjectNameFromCommand(details);
   }
 
+  const claudeTemp = CLAUDE_TEMP_CWD.exec(cwd);
+  if (claudeTemp?.[1]) {
+    const origin = getProjectName({...details, cwd: resolveClaudeSlug(claudeTemp[1])});
+    return origin ? `${origin}:tmp` : 'tmp';
+  }
+
+  const worktree = CLAUDE_WORKTREE_CWD.exec(cwd);
+  if (worktree?.[1] && worktree[2]) {
+    const repository = getProjectName({...details, cwd: worktree[1]});
+    return repository ? `${repository}@${worktree[2]}` : worktree[2];
+  }
+
   if (cwd.startsWith(`${home}${path.sep}`)) {
     const segments = path.relative(home, cwd).split(path.sep).filter(Boolean);
+    if (segments[0] === 'Library') {
+      return inferInstalledProjectName(details.args ?? '') ||
+        details.appFamily ||
+        inferAppFamily(details) ||
+        inferProjectNameFromCommand(details);
+    }
     if (PROJECT_ROOT_HINTS.has((segments[0] ?? '').toLowerCase())) {
       return segments[1] ?? inferProjectNameFromCommand(details);
     }
@@ -601,6 +633,45 @@ export function getProjectName(details: ListenerDetails): string {
 
   const basename = path.basename(cwd);
   return isGenericProjectDir(basename) ? inferProjectNameFromCommand(details) || basename : basename;
+}
+
+/** Claude names a temp folder after the original cwd with every non-alphanumeric character replaced by `-`. */
+export function resolveClaudeSlug(slug: string, root: string = path.sep): string {
+  let directory = root;
+  let rest = slug.replace(/^-/, '');
+  while (rest) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(directory);
+    } catch {
+      break;
+    }
+    const match = entries
+      .map((name) => ({name, key: name.replace(/[^a-zA-Z0-9]/g, '-')}))
+      .filter(({key}) => rest === key || rest.startsWith(`${key}-`))
+      .sort((left, right) => right.key.length - left.key.length)[0];
+    if (!match) break;
+    directory = path.join(directory, match.name);
+    rest = rest.slice(match.key.length + 1);
+  }
+  return rest ? path.join(directory, rest) : directory;
+}
+
+function inferInstalledProjectName(args: string): string {
+  for (const token of shellTokens(args)) {
+    const name = matchInstalledProject(token);
+    if (name) return name;
+  }
+  return '';
+}
+
+function matchInstalledProject(input: string): string {
+  const normalized = input.replace(/[\\/]+/g, '/');
+  for (const pattern of INSTALLED_PROJECT_PATTERNS) {
+    const name = pattern.exec(normalized)?.[1];
+    if (name) return name;
+  }
+  return '';
 }
 
 export function inferProjectNameFromCommand(details: Pick<ListenerDetails, 'command' | 'args'>): string {
@@ -622,8 +693,8 @@ export function inferProjectNameFromPath(input: string): string {
   if (!path.isAbsolute(value)) return '';
 
   const normalized = value.replace(/[\\/]+/g, '/');
-  const app = /\/Applications\/([^/]+)\.app(?:\/|$)/.exec(normalized);
-  if (app?.[1]) return app[1];
+  const installed = matchInstalledProject(normalized);
+  if (installed) return installed;
   const homebrew = /\/(?:opt|Cellar)\/([^/]+)(?:\/|$)/.exec(normalized);
   if (homebrew?.[1]) return homebrew[1];
   return normalizeProjectToken(value);
@@ -781,8 +852,19 @@ function parsePnpmDlxCommand(input: string): {packageName: string; trailingArgs:
   return packageName ? {packageName, trailingArgs: tokens.slice(index + 1).join(' ')} : null;
 }
 
+function shortenInterpreter(commandLine: string): string {
+  const split = commandLine.indexOf(' ');
+  const executable = split < 0 ? commandLine : commandLine.slice(0, split);
+  if (!path.isAbsolute(executable)) return commandLine;
+  for (const {pattern, name} of INTERPRETER_SHORT_NAMES) {
+    const match = pattern.exec(executable);
+    if (match) return `${name ?? match[1]}${commandLine.slice(executable.length)}`;
+  }
+  return commandLine;
+}
+
 function summarizeCommand(command: string, args: string, home: string): string {
-  const normalized = normalizeWhitespace(args);
+  const normalized = shortenInterpreter(normalizeWhitespace(args));
   if (!normalized) return command || '-';
   const dlx = parsePnpmDlxCommand(normalized);
   if (dlx) {
